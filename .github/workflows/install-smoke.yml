@@ -14,7 +14,10 @@ jobs:
           set -euo pipefail
           base=https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/releases/latest/download
           curl -fsSL --retry 3 "$base/install-linux.sh" -o /tmp/install-sgs.sh
-          install=$(sudo sh /tmp/install-sgs.sh --host 127.0.0.1)
+          if ! install=$(sudo sh /tmp/install-sgs.sh --host 127.0.0.1); then
+            sudo journalctl -u sgs-toolbox-sync -n 40 --no-pager
+            exit 1
+          fi
           setup_code=$(printf '%s\n' "$install" | sed -n 's/^First setup code: //p')
           admin_password=$(printf '%s\n' "$install" | sed -n 's/^Initial admin password: //p')
           [[ "$setup_code" =~ ^[A-Za-z0-9_-]{43}$ && "$admin_password" =~ ^A1[A-Za-z0-9_-]{43}$ ]]
@@ -25,7 +28,10 @@ jobs:
           }
           login 17431 "$setup_code"
           login 17430 "$admin_password"
-          reset=$(sudo /opt/sgs-toolbox-sync/reset-admin-password)
+          if ! reset=$(sudo /opt/sgs-toolbox-sync/reset-admin-password); then
+            sudo journalctl -u sgs-toolbox-sync -n 40 --no-pager
+            exit 1
+          fi
           reset=${reset#New admin password: }
           [[ "$reset" =~ ^A1[A-Za-z0-9_-]{43}$ && "$reset" != "$admin_password" ]]
           login 17430 "$reset"
