@@ -10,6 +10,14 @@ systemctl stop "$service"
 trap 'systemctl start "$service"' EXIT
 password=$(runuser -u "$service" -- "$root/runtime/node" "$root/current/tools/appearance-sync.mjs" \
     --data-dir "/var/lib/$service" --reset-admin-password)
+printf 'New admin password: %s\n' "$password"
 systemctl start "$service"
 trap - EXIT
-printf 'New admin password: %s\n' "$password"
+read -r sync_port admin_port < "$root/installed"
+for attempt in $(seq 1 30); do
+    if systemctl is-active --quiet "$service" &&
+        curl -fsS --noproxy '*' --max-time 2 "http://127.0.0.1:$admin_port/admin/" >/dev/null 2>&1; then exit; fi
+    sleep 1
+done
+echo "Admin panel failed its startup check. Inspect: journalctl -u $service -n 50" >&2
+exit 1

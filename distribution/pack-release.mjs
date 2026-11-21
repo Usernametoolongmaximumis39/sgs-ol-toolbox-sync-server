@@ -8,6 +8,11 @@ const dist = resolve(root, 'dist');
 await mkdir(dist, { recursive: true });
 const bundle = 'sgs-ol-toolbox-sync-server.tar.gz';
 const archive = resolve(dist, bundle);
+for (const name of ['install-linux.sh', 'install-updater.sh', 'reset-linux.sh']) {
+  if ((await readFile(resolve(root, 'distribution', name), 'utf8')).includes('\r')) {
+    throw new Error(name + ' requires LF line endings');
+  }
+}
 const result = spawnSync('tar', ['-czf', archive,
   'server-version.json', 'package.json', 'package-lock.json', 'LICENSE', 'README.md', 'AGENTS.md', 'llms.txt', 'src', 'tools', 'distribution',
   'node_modules/@hpke/common', 'node_modules/@hpke/core'], { cwd: root, stdio: 'inherit' });
