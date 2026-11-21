@@ -419,7 +419,7 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
     requireValue(!network.candidate, 'migration_in_progress', 409);
     const config = validateConfig(input, active.config, externalSync(), !publicMode());
     requireValue(!publicMode() || config.tls, 'https_required', 426);
-    requireValue(!publicMode() || !publicNetwork || config.domain && !/(^|\.)localhost$/.test(config.domain), 'public_domain_required');
+    requireValue(!publicMode() || !publicNetwork || !isLocalDomain(config.domain) && !isIPv4(config.domain), 'public_domain_required');
     const adminPort = admin.address().port;
     requireValue(config.port !== adminPort && config.redirectPort !== adminPort, 'port_in_use', 409);
     if (config.port === active.config.port) {
@@ -462,13 +462,14 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
     const serverUpdateStatus = await serverUpdate.status();
     const staged = network.candidate;
     const shared = publicMode(), tls = publicConfig();
+    const updateEndpoint = shared && !active.config.tls ? tls : active.config;
     const info = store.list(), labels = new Map(shared ? [] : data.listAccounts().map(row => [row.key, row.label]));
     return { ...info, accounts: shared ? [] : info.accounts.map(row => ({ ...row, label: labels.get(row.storeKey) ?? row.userCode })),
       activeEndpoint: statusOf(network.active),
       mode: shared ? 'public' : 'private', publicUrl: tls ? endpointUrl(tls) : null, publicPreview: canPreview(), publicNetwork,
       privateNetwork: !shared && privateNetwork,
       recoveryPending: !shared && store.archivedStores().length > 0,
-      updates: { ...updates.status(), url: endpointUrl(active.config) + '/updates' },
+      updates: { ...updates.status(), url: updateEndpoint ? endpointUrl(updateEndpoint) + '/updates' : null },
       serverUpdate: serverUpdateStatus,
       publicAccounts: shared ? vaults.accountStatus() : null,
       vaults: shared ? vaults.list() : [],
@@ -530,7 +531,7 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
           await data.serialize(async () => {
             requireValue(!publicMode(), 'public_mode_required', 409);
             requireValue(publicConfig(), 'https_required', 426);
-            requireValue(!publicNetwork || publicConfig().domain && !/(^|\.)localhost$/.test(publicConfig().domain), 'public_domain_required', 400);
+            requireValue(!publicNetwork || !isLocalDomain(publicConfig().domain) && !isIPv4(publicConfig().domain), 'public_domain_required', 400);
             requireValue(!store.archivedStores().length, 'recovery_pending', 409);
             requireValue(migrationStatus().every(row => row.ready), 'history_not_staged', 409);
             store.transaction(() => {

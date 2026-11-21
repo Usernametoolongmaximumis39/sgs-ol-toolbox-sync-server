@@ -676,6 +676,7 @@ test('HTTPS admin requires a password and limits sessions to the authenticated o
   assert.equal(status.status, 200);
   assert.equal(JSON.parse(status.text).mode, 'public');
   assert.equal(JSON.parse(status.text).publicPreview, true);
+  assert.equal(JSON.parse(status.text).updates.url, origin + '/updates');
   assert.equal((await secure('/admin/public/preview', { enabled: false }, { Cookie })).status, 200);
   assert.equal(JSON.parse((await secure('/admin/status', null, { Cookie })).text).publicPreview, false);
   assert.equal((await fetch(env.server.adminUrl + '/admin/status', { headers: { Cookie } })).status, 401);
