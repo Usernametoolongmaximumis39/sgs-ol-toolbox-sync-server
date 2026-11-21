@@ -399,6 +399,7 @@ function render(state, resetSettings = false) {
       updates.updatedAt && '上次同步 ' + displayTime(updates.updatedAt), updates.error].filter(Boolean).join(' · ');
   $('mirror-address').hidden = !updates?.enabled;
   $('mirror-address').textContent = updates?.url ?? '';
+  toggle('stargazing', state.stargazing === true);
   showServerUpdate(state.serverUpdate);
   $('migration').hidden = !candidate;
   $('cancel-migration').disabled = shared && !active.tls;
@@ -542,10 +543,10 @@ $('generate-credential').addEventListener('click', event => {
   }).finally(() => { button.disabled = false; });
 });
 for (const id of ['tls', 'redirect']) $(id).addEventListener('click', () => { toggle(id, !enabled(id)); showTlsFields(); });
-$('mirror').addEventListener('click', event => {
+for (const [id, path] of [['mirror', 'updates'], ['stargazing', 'stargazing']]) $(id).addEventListener('click', event => {
   const button = event.currentTarget;
   button.disabled = true;
-  void perform(async () => { render(await api('updates', { enabled: !enabled('mirror') })); })
+  void perform(async () => { render(await api(path, { enabled: !enabled(id) })); })
     .finally(() => { button.disabled = false; });
 });
 $('server-update-check').addEventListener('click', () => void perform(async () => {

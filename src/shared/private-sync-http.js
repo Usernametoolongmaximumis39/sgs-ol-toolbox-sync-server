@@ -1,4 +1,5 @@
-import { LEDGER_SYNC_PATH, MATCH_SYNC_PATH } from './sync-paths.js';
+import { BACKUP_READ_PATH, LEDGER_SYNC_PATH, MATCH_SYNC_PATH, PREFERENCES_SYNC_PATH } from './sync-paths.js';
+import { STARGAZING_SYNC_PATH } from './stargazing-source.js';
 
 export const SYNC_SOURCE_HEADER = 'X-SGS-Toolbox-Origin';
 export const PRIVATE_HTTP_TIMEOUT = 30000;
@@ -6,7 +7,7 @@ export const PRIVATE_HTTP_LIMIT = 24 * 1024 * 1024;
 const privatePaths = new Set([
   '/v1/proof', '/v1/confirm', '/v1/bind', '/v1/recover', '/v1/unbind',
   '/v1/private/request', '/v1/private/join', '/v1/private/release', '/v1/private/view',
-  '/v1/private/bind-credential', '/v1/preferences/sync', LEDGER_SYNC_PATH, MATCH_SYNC_PATH,
+  '/v1/private/bind-credential', PREFERENCES_SYNC_PATH, LEDGER_SYNC_PATH, MATCH_SYNC_PATH, BACKUP_READ_PATH, STARGAZING_SYNC_PATH,
 ]);
 
 export function privateSyncOrigin(value) {

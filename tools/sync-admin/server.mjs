@@ -15,9 +15,15 @@ import { equal, hash, isToken, openState, requireValue, SyncError, token } from 
 import { openPublicVaults, VAULT_BYTES } from './public-vault.mjs';
 import { openPrivatePreferences } from './preferences.mjs';
 import { PREFERENCES_LIMIT, PREFERENCES_SYNC_PATH } from '../../src/shared/sync-preferences.js';
+import { BACKUP_READ_PATH, PUBLIC_CHANGES_PATH, SYNC_CHANGES_PATH } from '../../src/shared/sync-paths.js';
+import { openBackupReads } from './backup-reads.mjs';
+import { openSyncChanges } from './sync-changes.mjs';
+import { openPrivateHistory } from './private-history.mjs';
 import { SYNC_SOURCE_HEADER } from '../../src/shared/private-sync-http.js';
+import { STARGAZING_SYNC_PATH } from '../../src/shared/stargazing-source.js';
 import { openUpdateMirror } from './update-mirror.mjs';
 import { openServerUpdate } from './server-update.mjs';
+import { openStargazing } from './stargazing.mjs';
 import { openAdminPassword, resetAdminPassword, validAdminPassword } from './admin-password.mjs';
 import { createSetupCode, readInitialSetup } from './initial-setup.mjs';
 import { adminPathMatches, httpAdminOrigin, httpAdminRequestOrigin, localAdminPath, validateAdminEntry } from './admin-entry.mjs';
@@ -27,15 +33,15 @@ const grace = 60 * 60000;
 const settings = { requestTimeout: 10000, headersTimeout: 5000, keepAliveTimeout: 2000 };
 const assets = { '/admin/': ['index.html', 'text/html'], '/admin/app.js': ['app.js', 'text/javascript'], '/admin/style.css': ['style.css', 'text/css'] };
 const pairingPaths = new Set(['/v1/proof', '/v1/bind', '/v1/recover', '/v1/confirm', '/v1/unbind',
-  '/v1/private/request', '/v1/private/join', '/v1/private/release', '/v1/private/view', '/v1/private/bind-credential', PREFERENCES_SYNC_PATH]);
-const vaultPaths = new Set(['/v2/vault/register', '/v2/vault/exchange', '/v2/vault/view', '/v2/migrate/read', '/v2/migrate/stage']);
+  '/v1/private/request', '/v1/private/join', '/v1/private/release', '/v1/private/view', '/v1/private/bind-credential', PREFERENCES_SYNC_PATH, BACKUP_READ_PATH, SYNC_CHANGES_PATH]);
+const vaultPaths = new Set(['/v2/vault/register', '/v2/vault/exchange', '/v2/vault/backup', '/v2/vault/view', '/v2/migrate/read', '/v2/migrate/stage', PUBLIC_CHANGES_PATH]);
 const nonceFormat = /^[A-Za-z0-9_-]{22}$/;
 const maxAdminBody = 128 * 1024;
 const setupNetworkPaths = ['/admin/status', '/admin/network', '/admin/cancel', '/admin/public/enable'];
 const httpUrl = port => new URL(`http://${host}:${port}`).origin;
 const endpointUrl = ({ tls, domain, port }) => new URL(`${tls ? 'https' : 'http'}://${domain || host}:${port}`).origin;
 const asInvite = config => ({ ...config, ipv4: host, local: true });
-const isLocalDomain = domain => !domain || /^(?:[a-z0-9-]+\.)*localhost$/.test(domain) || /^127\./.test(domain);
+const isLocalDomain = domain => !domain || /^(?:[a-z0-9-]+\.)*localhost$/.test(domain) || isIPv4(domain) && domain.startsWith('127.');
 
 const listen = (server, port, address = host) => new Promise((ready, reject) => {
   server.once('error', reject);
@@ -100,7 +106,8 @@ function statusOf(config) {
 
 export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = false, port = 17429, adminPort = 17430, now = Date.now,
   interval = true, allowedOrigins = syncOrigins, publicNetwork = false, privateNetwork = false, relocate = false, legacyInvitations = false,
-  httpsAdmin = false, updateFetch, updateToken, serverUpdateDir, setupHost, setupPort = 17431, httpAdminEnabled = Boolean(setupHost) } = {}) {
+  httpsAdmin = false, updateFetch, updateToken, serverUpdateDir, stargazingFetch,
+  setupHost, setupPort = 17431, httpAdminEnabled = Boolean(setupHost) } = {}) {
   requireValue(!httpsAdmin || publicNetwork, 'https_admin_requires_public_network');
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const adminFile = join(dataDir, 'admin-token');
@@ -109,14 +116,19 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
   const store = openState(join(dataDir, 'sync.sqlite3'), port, now);
   let adminEntry = validateAdminEntry(store.get('adminEntry') ?? { enabled: httpAdminEnabled, host: setupHost, port: setupPort, path: localAdminPath });
   let httpAdmin, httpAdminError;
-  const vaults = openPublicVaults(store, now);
-  const preferences = openPrivatePreferences(store);
+  const changes = openSyncChanges(store);
+  const vaults = openPublicVaults(store, now, changes);
+  const backupReads = openBackupReads(store, now);
+  const preferences = openPrivatePreferences(store, changes);
   let data;
-  try { data = await openAppearanceSyncData({ file: dataFile ?? join(dataDir, 'store.json'), catalogue }); }
+  try { data = await openAppearanceSyncData({ file: dataFile ?? join(dataDir, 'store.json'), catalogue,
+    history: openPrivateHistory(store, changes) }); }
   catch (error) { store.close(); throw error; }
   const updates = await openUpdateMirror({ dataDir, enabled: () => store.get('updateMirror') !== false,
     auto: interval, fetchImpl: updateFetch, token: updateToken, now });
   const serverUpdate = openServerUpdate(serverUpdateDir);
+  const stargazingEnabled = () => store.get('stargazing') !== false;
+  const stargazing = openStargazing({ enabled: stargazingEnabled, fetchImpl: stargazingFetch, now });
   let network = store.get('network'), active, candidate, admin, counter, closed = false, migrationError = '', retryAt = 0;
   let legacyPort = legacy ? store.get('legacyPort') : null;
   let pending = Promise.resolve();
@@ -128,7 +140,10 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
   const httpsReady = config => Boolean(config && Date.parse(config.certificateExpires) > now());
   const canPreview = () => publicMode() && store.get('publicPreview') !== false;
   const snapshot = key => {
-    const dataSnapshot = data.snapshot(key);
+    const { matches, ledger } = data.snapshot(key);
+    const { updatedAt, balances, events, ...details } = ledger;
+    // Keep the migration fingerprint stable when SQLite reconstructs the ledger from records.
+    const dataSnapshot = { matches, ledger: { updatedAt, balances, events, ...details } };
     const saved = preferences.snapshot(key);
     if (Object.keys(saved).length) dataSnapshot.preferences = saved;
     return { snapshot: dataSnapshot, fingerprint: hash(JSON.stringify(dataSnapshot)) };
@@ -150,6 +165,7 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
     store.clearPrivateCredentials();
     vaults.clearMigrationIndex();
     store.set('plaintextCleanupPending', false);
+    store.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   }
   async function purgeRemoved() {
     const expired = store.archivedStores().filter(row => row.recoverUntil <= now());
@@ -232,7 +248,7 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
       if (request.method === 'GET' && request.url === '/health') {
         return send(response, 200, { ok: true, service: 'appearances-sync', mode: publicMode() ? 'public' : 'private' });
       }
-      if (!pairingPaths.has(request.url) && !vaultPaths.has(request.url)) {
+      if (!pairingPaths.has(request.url) && !vaultPaths.has(request.url) && request.url !== STARGAZING_SYNC_PATH) {
         requireValue(!publicMode(), 'public_mode_required', 404);
         const url = new URL(request.url, origins[0]);
         if (url.pathname === '/ledger/' || url.pathname === '/ledger/read') {
@@ -264,6 +280,12 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
         if (request.headers['access-control-request-private-network'] === 'true') response.setHeader('Access-Control-Allow-Private-Network', 'true');
         return response.writeHead(204).end();
       }
+      if (request.url === STARGAZING_SYNC_PATH) {
+        const body = await readPost(request, 4096);
+        if (publicMode()) vaults.authenticate(body);
+        else requireValue(store.authenticate(request.headers.authorization), 'binding_required', 401);
+        return send(response, 200, await stargazing.read());
+      }
       if (vaultPaths.has(request.url)) {
         requireValue(current.tls, 'https_required', 426);
         const migrating = request.url.startsWith('/v2/migrate/');
@@ -282,6 +304,18 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
           });
         }
         requireValue(publicMode(), 'not_public', 409);
+        if (request.url === PUBLIC_CHANGES_PATH) {
+          const reply = vaults.changes(body);
+          await serialize(() => confirmCandidate(listener, request.socket.remoteAddress));
+          return send(response, 200, reply);
+        }
+        if (request.url.endsWith('/backup')) {
+          requireValue(isToken(body.device));
+          vaults.authenticate(body);
+          const reply = backupReads.download('public:' + body.vault + ':' + body.device, () => vaults.snapshot(body.vault));
+          await serialize(() => confirmCandidate(listener, request.socket.remoteAddress));
+          return send(response, 200, reply);
+        }
         if (request.url.endsWith('/register')) {
           attempt('vault-register:' + request.socket.remoteAddress, 15, 3600000);
           vaults.register(body);
@@ -294,6 +328,24 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
         }
         requireValue(canPreview(), 'public_preview_disabled', 403);
         return send(response, 200, vaults.preview(body, request.socket.remoteAddress));
+      }
+      if (request.url === BACKUP_READ_PATH || request.url === SYNC_CHANGES_PATH) {
+        const body = await readPost(request, 4096);
+        return data.serialize(() => {
+          requireValue(!publicMode(), 'public_mode_required', 409);
+          const device = store.authenticate(request.headers.authorization);
+          requireValue(device, 'binding_required', 401);
+          requireValue(body.account === device.gameKey, 'account_mismatch', 403);
+          const stream = 'private:' + device.storeKey;
+          if (request.url === SYNC_CHANGES_PATH || Object.hasOwn(body, 'after')) {
+            return send(response, 200, store.transaction(() => changes.read(stream, body.after)));
+          }
+          const binding = stream + ':' + (device.installation || device.id);
+          return send(response, 200, backupReads.page(binding, body, () => ({
+            snapshot: { ...data.snapshot(device.storeKey), preferences: preferences.snapshot(device.storeKey) },
+            cursor: changes.cursor(stream),
+          })));
+        });
       }
       if (request.url === PREFERENCES_SYNC_PATH) {
         const body = await readPost(request, PREFERENCES_LIMIT + 4096);
@@ -344,7 +396,8 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
         const challenge = randomBytes(16).toString('base64url');
         listener.challenges.set(challenge, time + 60000);
         const proof = { nonce: body.nonce, origin: address, revision: network.revision, challenge,
-          next: listener === active && candidate?.enabled ? endpointUrl(candidate.config) : null };
+          next: listener === active && candidate?.enabled ? endpointUrl(candidate.config) : null,
+          ...(body.stargazing === true && { stargazing: stargazingEnabled() }) };
         const signature = sign('sha256', syncProofBytes(proof), { key: store.identity.privateKey, dsaEncoding: 'ieee-p1363' });
         return send(response, 200, { ...proof, signature: signature.toString('base64url') });
       }
@@ -528,6 +581,7 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
       privateNetwork: !shared && privateNetwork,
       recoveryPending: !shared && store.archivedStores().length > 0,
       updates: { ...updates.status(), url: updateEndpoint ? endpointUrl(updateEndpoint) + '/updates' : null },
+      stargazing: stargazingEnabled(),
       serverUpdate: serverUpdateStatus,
       publicAccounts: shared ? vaults.accountStatus() : null,
       vaults: shared ? vaults.list() : [],
@@ -638,7 +692,7 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
       }
     }
     if (publicMode()) requireValue(['/admin/network', '/admin/cancel', '/admin/public/preview', '/admin/public/revoke',
-      '/admin/public/limit', '/admin/updates', '/admin/server-update'].includes(route),
+      '/admin/public/limit', '/admin/updates', '/admin/stargazing', '/admin/server-update'].includes(route),
       'public_mode_required', 409);
     switch (route) {
       case '/admin/public/enable':
@@ -675,6 +729,10 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
         requireValue(typeof body.enabled === 'boolean');
         store.set('updateMirror', body.enabled);
         if (body.enabled) void updates.check();
+        break;
+      case '/admin/stargazing':
+        requireValue(typeof body.enabled === 'boolean');
+        store.set('stargazing', body.enabled);
         break;
       case '/admin/server-update':
         await serverUpdate.request(body.action, body.version);

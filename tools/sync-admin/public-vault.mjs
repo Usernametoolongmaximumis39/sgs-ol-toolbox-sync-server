@@ -1,6 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { equal, hash, isToken, requireValue, SyncError } from './state.mjs';
 import { PREFERENCE_GROUPS, PREFERENCES_LIMIT } from '../../src/shared/sync-preferences.js';
+import { openSyncChanges } from './sync-changes.mjs';
 
 export const VAULT_BYTES = 64 * 1024 * 1024;
 const LOCK_TIME = 30 * 60000;
@@ -26,7 +27,7 @@ function validateRecords(records, max = recordLimit) {
   return keys;
 }
 
-export function openPublicVaults(store, now) {
+export function openPublicVaults(store, now, changes = openSyncChanges(store)) {
   const { db, transaction } = store;
   db.exec(`
     CREATE TABLE IF NOT EXISTS vaults (
@@ -51,6 +52,7 @@ export function openPublicVaults(store, now) {
     return row;
   };
   const read = db.prepare('SELECT kind, record_id AS id, ciphertext FROM vault_records WHERE vault = ? ORDER BY rowid');
+  const readRecord = db.prepare('SELECT ciphertext FROM vault_records WHERE vault = ? AND kind = ? AND record_id = ?');
   const viewRead = db.prepare("SELECT kind, record_id AS id, ciphertext FROM vault_records WHERE vault = ? AND kind IN ('event', 'match') ORDER BY rowid");
   const upsert = db.prepare(`INSERT INTO vault_records VALUES (?, ?, ?, ?)
     ON CONFLICT (vault, kind, record_id) DO UPDATE SET ciphertext = excluded.ciphertext`);
@@ -60,6 +62,7 @@ export function openPublicVaults(store, now) {
     const { count, bytes } = db.prepare('SELECT count(*) AS count, COALESCE(sum(length(ciphertext) + length(record_id) + 24), 0) AS bytes FROM vault_records WHERE vault = ?').get(vault);
     requireValue(count <= recordLimit && bytes < VAULT_BYTES, 'vault_limit', 413);
     db.prepare('UPDATE vaults SET revision = revision + 1, bytes = ? WHERE id = ?').run(bytes, vault);
+    changes.record('public:' + vault, records.map(([kind, id]) => [kind, id, true]));
   };
   function register(body, enforceLimit) {
     const { vault, credential, verifier } = body;
@@ -83,14 +86,31 @@ export function openPublicVaults(store, now) {
       store.set('publicAccountLimit', limit);
     },
     exchange(body) {
-      const { vault, revision, records } = body;
+      const { vault, revision, records, keys } = body;
       requireValue(Number.isSafeInteger(revision) && revision >= -1, 'invalid_revision');
       validateRecords(records);
+      if (keys !== undefined) {
+        requireValue(Array.isArray(keys) && keys.every(key => Array.isArray(key) && key.length === 2), 'invalid_record_id');
+        validateRecords(keys.map(([kind, id]) => [kind, id, 'A'.repeat(38)]));
+      }
       return transaction(() => {
         const current = authenticate(body);
-        if (current.revision !== revision) return { revision: current.revision, records: readRecords(read, vault) };
+        if (current.revision !== revision) {
+          const selected = keys === undefined ? readRecords(read, vault) : keys.flatMap(([kind, id]) => {
+            const row = readRecord.get(vault, kind, id);
+            return row ? [[kind, id, row.ciphertext]] : [];
+          });
+          return { revision: current.revision, records: selected };
+        }
         if (records.length) saveRecords(vault, records);
         return { revision: current.revision + Number(records.length > 0), records: null };
+      });
+    },
+    snapshot: vault => ({ snapshot: readRecords(read, vault), cursor: changes.cursor('public:' + vault) }),
+    changes(body) {
+      return transaction(() => {
+        authenticate(body);
+        return changes.read('public:' + body.vault, body.after, (kind, id) => readRecord.get(body.vault, kind, id).ciphertext);
       });
     },
     stage(source, fingerprint, expectedKeys, body) {
@@ -101,6 +121,7 @@ export function openPublicVaults(store, now) {
         requireValue(!prior || prior.vault === body.vault, 'migration_already_staged', 409);
         register(body, false);
         db.prepare('DELETE FROM vault_records WHERE vault = ?').run(body.vault);
+        changes.reset('public:' + body.vault);
         saveRecords(body.vault, body.records);
         db.prepare('INSERT OR REPLACE INTO vault_migrations VALUES (?, ?, ?)').run(source, fingerprint, body.vault);
       });
@@ -116,6 +137,7 @@ export function openPublicVaults(store, now) {
         requireValue(row, 'not_found', 404);
         db.prepare('DELETE FROM vault_migrations WHERE source = ?').run(source);
         db.prepare('DELETE FROM vault_records WHERE vault = ?').run(row.vault);
+        changes.reset('public:' + row.vault);
         db.prepare('DELETE FROM vaults WHERE id = ?').run(row.vault);
       });
     },

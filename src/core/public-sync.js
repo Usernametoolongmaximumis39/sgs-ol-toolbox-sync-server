@@ -2,8 +2,8 @@ import { base64url, fromBase64url } from './sync-pairing-code.js';
 import { EMPTY_LEDGER, ledgerDownload, mergeLedgerUpload } from './sync-ledger-records.js';
 import { vaultRecords, vaultSnapshot } from './sync-vault-records.js';
 import { MATCH_SYNC_LIMIT, sameSyncMatch } from '../shared/match-sync-records.js';
-import { LEDGER_SYNC_PATH } from '../shared/sync-paths.js';
-import { cleanPreferences, PREFERENCES_SYNC_PATH } from '../shared/sync-preferences.js';
+import { BACKUP_READ_PATH, LEDGER_SYNC_PATH, PUBLIC_CHANGES_PATH, SYNC_CHANGES_PATH } from '../shared/sync-paths.js';
+import { cleanPreferences, mergePreferenceUpload, PREFERENCES_SYNC_PATH } from '../shared/sync-preferences.js';
 
 const encode = new TextEncoder(), decode = new TextDecoder('utf-8', { fatal: true });
 const alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -86,19 +86,38 @@ export function createPublicTransport(crypto, post) {
     return states.get(entry);
   }
   async function exchange(entry, origin, path, data, signal) {
+    if (path === BACKUP_READ_PATH) {
+      const { cipher } = await stateFor(entry);
+      const reply = await post(origin, '/v2/vault/backup', { ...authorize(entry), device: entry.device }, { signal });
+      if (reply.retryAfter) return reply;
+      return { snapshot: vaultSnapshot(await Promise.all(reply.snapshot.map(cipher.open))), cursor: reply.cursor };
+    }
+    if (path === SYNC_CHANGES_PATH) {
+      const { cipher } = await stateFor(entry);
+      const reply = await post(origin, PUBLIC_CHANGES_PATH, { ...authorize(entry), after: data.after }, { signal });
+      if (reply.reset) return reply;
+      const records = await Promise.all(reply.records.map(row => row[2] === null ? row : cipher.open(row)));
+      return { ...reply, records };
+    }
     const state = await stateFor(entry), auth = authorize(entry);
+    let keys;
+    if (data.uploadOnly) {
+      if (path === PREFERENCES_SYNC_PATH) keys = data.groups.map(group => ['preferences', group]);
+      else if (path === LEDGER_SYNC_PATH) keys = [['ledger', 'details'], ...data.events.map(row => ['event', row.id])];
+      else keys = [...(data.names ? [['ledger', 'details']] : []), ...data.matches.map(row => ['match', row.gameId])];
+    }
     const run = state.pending.then(async () => {
+      let revision = keys ? -1 : state.revision, before = state.snapshot;
       for (let attempt = 0; attempt < 5; attempt++) {
-        const reply = await post(origin, '/v2/vault/exchange', { ...auth, revision: state.revision, records: [] }, { signal });
-        if (reply.records !== null) {
-          state.snapshot = vaultSnapshot(await Promise.all(reply.records.map(state.cipher.open)));
-          state.revision = reply.revision;
-        }
-        const before = state.snapshot;
+        const parameters = keys ? { ...auth, keys } : auth;
+        const reply = await post(origin, '/v2/vault/exchange', { ...parameters, revision, records: [] }, { signal });
+        if (reply.records !== null) before = vaultSnapshot(await Promise.all(reply.records.map(state.cipher.open)));
+        revision = reply.revision;
+        if (!keys) { state.snapshot = before; state.revision = revision; }
         let next = before, result;
         if (path === PREFERENCES_SYNC_PATH) {
           const known = before.preferences ?? {};
-          if (data.values) next = { ...before, preferences: { ...known, ...cleanPreferences(data.values) } };
+          if (data.values) next = { ...before, preferences: mergePreferenceUpload(known, cleanPreferences(data.values), data) };
           result = { values: Object.fromEntries(data.groups.filter(group => known[group] !== undefined).map(group => [group, known[group]])) };
         } else if (path === LEDGER_SYNC_PATH) {
           const { entry: ledger, conflicts } = mergeLedgerUpload(before.ledger, data, Date.now(), () => ledgerVersion(crypto));
@@ -113,17 +132,16 @@ export function createPublicTransport(crypto, post) {
           if (matches.size > MATCH_SYNC_LIMIT) throw new Error('云端战绩达到容量上限');
           const names = data.names ? { ...before.ledger.names, ...data.names } : before.ledger.names;
           next = { matches: [...matches.values()], ledger: { ...before.ledger, names } };
-          result = { matches: next.matches };
+          result = data.uploadOnly ? { ok: true } : { matches: next.matches };
         }
         if (next === before) return result;
         const originals = new Map(vaultRecords(before).map(([kind, id, details]) => [kind + ':' + id, JSON.stringify(details)]));
         const changed = vaultRecords(next).filter(([kind, id, details]) => originals.get(kind + ':' + id) !== JSON.stringify(details));
         if (!changed.length) return result;
         const records = await Promise.all(changed.map(state.cipher.seal));
-        const commit = await post(origin, '/v2/vault/exchange', { ...auth, revision: state.revision, records }, { signal });
+        const commit = await post(origin, '/v2/vault/exchange', { ...parameters, revision, records }, { signal });
         if (commit.records !== null) continue;
-        state.revision = commit.revision;
-        state.snapshot = next;
+        if (!keys) { state.revision = commit.revision; state.snapshot = next; }
         return result;
       }
       throw new Error('云端记录正在被其他设备修改，请重试');
@@ -143,7 +161,7 @@ export function createPublicTransport(crypto, post) {
       const records = await Promise.all(vaultRecords(snapshot).map(cipher.seal));
       await post(entry.origin, '/v2/migrate/stage', { ...authorize(entry), verifier: cipher.verifier, fingerprint, records }, { device });
     },
-    check: entry => post(entry.origin, '/v2/vault/exchange', { ...authorize(entry), revision: -1, records: [] }),
+    check: entry => post(entry.origin, '/v2/vault/exchange', { ...authorize(entry), revision: -1, keys: [], records: [] }),
     async preview(code, pass) {
       const [address, vault, seed] = unpack('SGSV1', code.trim(), 3);
       const password = pass.trim().toUpperCase();

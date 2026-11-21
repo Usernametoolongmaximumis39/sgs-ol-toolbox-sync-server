@@ -124,6 +124,8 @@ export async function openPairing(code, prefix, findRecipientKeys) {
   return { ...parseEndpoint(new Uint8Array(plaintext), prefix === PAIR_INVITE), requestId };
 }
 
-export function syncProofBytes({ nonce, origin, next, revision, challenge }) {
-  return utf8.encode(JSON.stringify([nonce, origin, next, revision, challenge]));
+export function syncProofBytes({ nonce, origin, next, revision, challenge, stargazing }) {
+  const fields = [nonce, origin, next, revision, challenge];
+  if (typeof stargazing === 'boolean') fields.push(stargazing);
+  return utf8.encode(JSON.stringify(fields));
 }

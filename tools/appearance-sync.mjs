@@ -51,14 +51,16 @@ export async function readJson(request, limit) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-export async function openAppearanceSyncData({ file = EXISTING_SYNC_FILE, ledgerFile = `${file}.ledger`, catalogue } = {}) {
+export async function openAppearanceSyncData({ file = EXISTING_SYNC_FILE, ledgerFile = `${file}.ledger`, catalogue, history } = {}) {
   const generals = catalogue ?? (file === EXISTING_SYNC_FILE ? await openGeneralCatalogue(`${file}.generals.json`) : null);
-  const saved = await readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return '{}'; throw error; });
-  const accounts = new Map(Object.entries(JSON.parse(saved)).map(([key, rows]) => {
+  const readLegacy = async () => JSON.parse(await readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return '{}'; throw error; }));
+  const saved = history?.matches ?? await readLegacy();
+  const accounts = new Map(Object.entries(saved).map(([key, rows]) => {
     if (!accountPattern.test(key)) throw new Error('invalid_stored_account');
     return [key, new Map(readMatches(rows).map(row => [row.gameId, row]))];
   }));
-  const ledger = await openLedgerSyncStore(ledgerFile);
+  const ledger = await openLedgerSyncStore(ledgerFile, history);
+  history?.seed(accounts, ledger.entries());
   let writes = Promise.resolve();
   async function saveMatches(snapshot) {
     await mkdir(dirname(file), { recursive: true });
@@ -66,7 +68,7 @@ export async function openAppearanceSyncData({ file = EXISTING_SYNC_FILE, ledger
     await rename(`${file}.tmp`, file);
   }
   const matchSnapshot = () => Object.fromEntries([...accounts].map(([key, value]) => [key, [...value.values()]]));
-  async function exchange(account, uploaded) {
+  async function exchange(account, uploaded, uploadOnly) {
     const previous = accounts.get(account) ?? new Map();
     const matches = new Map(previous);
     let changed = false;
@@ -80,10 +82,11 @@ export async function openAppearanceSyncData({ file = EXISTING_SYNC_FILE, ledger
     if (matches.size > MATCH_SYNC_LIMIT) return { status: 409, body: { error: 'account_limit' } };
     const rows = [...matches.values()];
     if (changed) {
-      await saveMatches({ ...matchSnapshot(), [account]: rows });
+      if (history) history.writeMatches(account, previous, rows);
+      else await saveMatches({ ...matchSnapshot(), [account]: rows });
       accounts.set(account, matches);
     }
-    return { status: 200, body: { account, matches: rows } };
+    return { status: 200, body: { account, ...(uploadOnly ? { ok: true } : { matches: rows }) } };
   }
 
   const hasAccount = key => accounts.has(key) || ledger.hasAccount(key);
@@ -165,7 +168,7 @@ export async function openAppearanceSyncData({ file = EXISTING_SYNC_FILE, ledger
       const blocked = canWrite(storeKey);
       if (blocked !== true) return { status: 409, body: { error: blocked } };
       if (isLedger) return { status: 200, body: { ...await ledger.exchange(storeKey, uploaded), account: payload.account } };
-      const result = await exchange(storeKey, uploaded);
+      const result = await exchange(storeKey, uploaded, payload.uploadOnly === true);
       if (result.status === 200) {
         if (Object.keys(names).length) await ledger.saveNames(storeKey, names);
         result.body.account = payload.account;
@@ -181,13 +184,14 @@ export async function openAppearanceSyncData({ file = EXISTING_SYNC_FILE, ledger
     handle, hasAccount, listAccounts: () => ledger.listAccounts(accounts),
     snapshot: key => ({ matches: [...(accounts.get(key)?.values() ?? [])], ledger: ledger.snapshot(key) }),
     async removeAccount(key) {
-      if (accounts.has(key)) {
-        const next = matchSnapshot();
+      const next = history ? await readLegacy() : matchSnapshot();
+      if (Object.hasOwn(next, key)) {
         delete next[key];
         await saveMatches(next);
-        accounts.delete(key);
       }
       await ledger.remove(key);
+      history?.remove(key);
+      accounts.delete(key);
     },
     serialize(work) {
       const next = writes.then(work);
@@ -196,8 +200,9 @@ export async function openAppearanceSyncData({ file = EXISTING_SYNC_FILE, ledger
     },
     async clearPlaintext() {
       await saveMatches({});
-      accounts.clear();
       await ledger.clear();
+      history?.clear();
+      accounts.clear();
     },
     async close() { await writes; await generals?.stop(); },
   };

@@ -17,9 +17,13 @@ async function replaceJson(file, value) {
   await rename(`${file}.tmp`, file);
 }
 
-export async function openLedgerSyncStore(file) {
-  const saved = await readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return '{}'; throw error; });
-  const ledger = new Map(Object.entries(JSON.parse(saved)).map(([account, entry]) => [
+async function readLedgerFile(file) {
+  return JSON.parse(await readFile(file, 'utf8').catch(error => { if (error.code === 'ENOENT') return '{}'; throw error; }));
+}
+
+export async function openLedgerSyncStore(file, history) {
+  const saved = history?.ledgers ?? await readLedgerFile(file);
+  const ledger = new Map(Object.entries(saved).map(([account, entry]) => [
     account, { ...entry, eventVersion: entry.eventVersion ?? (entry.events.length ? randomUUID() : null) },
   ]));
   const observed = new WeakMap();
@@ -31,9 +35,8 @@ export async function openLedgerSyncStore(file) {
     return observed.get(events);
   }
   async function commit(account, entry) {
-    const view = Object.fromEntries(ledger);
-    view[account] = entry;
-    await replaceJson(file, view);
+    if (history) history.writeLedger(account, ledger.get(account) ?? EMPTY, entry);
+    else await replaceJson(file, { ...Object.fromEntries(ledger), [account]: entry });
     ledger.set(account, entry);
   }
 
@@ -109,12 +112,14 @@ export async function openLedgerSyncStore(file) {
     return { accounts: accounts.map(({ key, label }) => ({ key, label })), account: key ?? null, profile, updatedAt: entry.updatedAt,
       balances: visibleBalances(entry), summary, rows, amounts, count: history.length, latestLogin: entry.profile?.session.at ?? null, page: shownPage, pages };
   }
-  return { exchange, saveNames, preview, listAccounts, hasAccount: key => ledger.has(key), snapshot: key => ledger.get(key) ?? EMPTY,
+  return { exchange, saveNames, preview, listAccounts, entries: () => ledger.entries(),
+    hasAccount: key => ledger.has(key), snapshot: key => ledger.get(key) ?? EMPTY,
     async remove(key) {
-      if (!ledger.has(key)) return;
-      const next = Object.fromEntries(ledger);
-      delete next[key];
-      await replaceJson(file, next);
+      const next = history ? await readLedgerFile(file) : Object.fromEntries(ledger);
+      if (Object.hasOwn(next, key)) {
+        delete next[key];
+        await replaceJson(file, next);
+      }
       ledger.delete(key);
     },
     async clear() { await replaceJson(file, {}); ledger.clear(); } };

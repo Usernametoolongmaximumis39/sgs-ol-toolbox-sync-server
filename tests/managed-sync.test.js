@@ -3,10 +3,11 @@ import { createHash, randomBytes, webcrypto } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { copyFile, mkdtemp, readFile, readdir, rmdir, symlink, unlink, writeFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { startAppearanceSync } from '../tools/appearance-sync.mjs';
@@ -15,8 +16,12 @@ import { createSetupCode } from '../tools/sync-admin/initial-setup.mjs';
 import { resetAdminPassword } from '../tools/sync-admin/admin-password.mjs';
 import { openState } from '../tools/sync-admin/state.mjs';
 import { openPublicVaults } from '../tools/sync-admin/public-vault.mjs';
+import { openSyncChanges } from '../tools/sync-admin/sync-changes.mjs';
 import { createPublicTransport, createVaultCipher, randomPass } from '../src/core/public-sync.js';
 import { openPrivateCredential } from '../src/core/private-sync-code.js';
+import { privateHttpRequest, privateSyncOrigin } from '../src/shared/private-sync-http.js';
+import { BACKUP_READ_PATH, SYNC_CHANGES_PATH } from '../src/shared/sync-paths.js';
+import { STARGAZING_REPORT, STARGAZING_REPORT_LIMIT, STARGAZING_SYNC_PATH } from '../src/shared/stargazing-source.js';
 import { base64url, createPairingRequest, fromBase64url, openPairing, readPairingRequest, sealPairing, syncProofBytes,
   PAIR_INVITE, PAIR_UPDATE } from '../src/core/sync-pairing-code.js';
 
@@ -123,9 +128,9 @@ async function privateCredentialBody(opened, game) {
   return { grant: opened.grant, gameKey: gameKey(game), userCode: String(game), installation: token(), device: token(),
     request: request.code, requestId: request.id };
 }
-async function proof(base, signer) {
+async function proof(base, signer, options) {
   const nonce = token(16);
-  const response = await post(base, '/v1/proof', { nonce });
+  const response = await post(base, '/v1/proof', { nonce, ...options });
   assert.equal(response.status, 200);
   const body = await response.json();
   assert.equal(body.nonce, nonce);
@@ -134,6 +139,52 @@ async function proof(base, signer) {
   assert.equal(await webcrypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, key, fromBase64url(body.signature, 64), syncProofBytes(body)), true);
   return body;
 }
+
+test('private stargazing uses a shared bounded cache and persists the administrator switch', async t => {
+  const report = { updatedAt: '2026/11/21 12:00:00', sections: [{ kind: 'table', title: '观星', columns: ['活动'], rows: [{ 活动: '演练' }] }] };
+  let requests = 0, upstream = () => Response.json(report);
+  const env = await fixture(t, { stargazingFetch(url, options) {
+    requests++;
+    assert.equal(url, STARGAZING_REPORT);
+    assert.equal(options.credentials, 'omit');
+    assert.equal(options.redirect, 'error');
+    return upstream();
+  } });
+  const base = env.server.syncUrl, operator = await admin(env.server);
+  assert.equal((await (await operator.get('/admin/status')).json()).stargazing, true);
+  assert.equal((await post(env.server.adminUrl, '/admin/stargazing', { enabled: false }, { Origin: env.server.adminUrl })).status, 401);
+  assert.equal((await post(base, STARGAZING_SYNC_PATH, {})).status, 401);
+  assert.equal(requests, 0);
+  const invitation = await invite(operator);
+  const bound = bindBody(invitation);
+  assert.equal((await post(base, '/v1/bind', bound)).status, 200);
+  const query = (origin = base) => post(origin, STARGAZING_SYNC_PATH, {}, auth(bound.device));
+  assert.equal((await proof(base, invitation.decoded.signer, { stargazing: true })).stargazing, true);
+  assert.equal((await proof(base, invitation.decoded.signer)).stargazing, undefined);
+  const results = await Promise.all([query(), query()]);
+  for (const result of results) {
+    assert.equal(result.status, 200);
+    assert.deepEqual(await result.json(), report);
+  }
+  assert.equal(requests, 1);
+  env.advance(60_000);
+  upstream = () => new Response(' '.repeat(STARGAZING_REPORT_LIMIT + 1), { headers: { 'Content-Type': 'application/json' } });
+  assert.deepEqual(await (await query()).json(), report);
+  assert.deepEqual(await (await query()).json(), report);
+  assert.equal(requests, 2);
+  env.advance(6 * 60 * 60_000);
+  upstream = () => Response.json({ sections: [{ kind: 'table' }] });
+  assert.equal((await query()).status, 503);
+  assert.equal((await operator.send('stargazing', { enabled: false })).status, 200);
+  assert.equal((await proof(base, invitation.decoded.signer, { stargazing: true })).stargazing, false);
+  await env.server.close();
+  await env.start();
+  assert.equal((await query(env.server.syncUrl)).status, 409);
+  assert.equal(requests, 3);
+  assert.equal((await (await admin(env.server)).send('stargazing', { enabled: true })).status, 200);
+  upstream = () => Response.json(report);
+  assert.deepEqual(await (await query(env.server.syncUrl)).json(), report);
+});
 
 test('HPKE invitations preserve endpoint fields and require the device key', async () => {
   const request = await createPairingRequest(webcrypto), other = await createPairingRequest(webcrypto);
@@ -401,7 +452,7 @@ test('primary credentials bind another device, follow ownership transfer and res
   await source.server.close();
 
   const destination = await fixture(t, { relocate: true, seed: async dir => {
-    for (const name of ['sync.sqlite3', 'store.json', 'store.json.ledger']) await copyFile(join(source.dir, name), join(dir, name));
+    await copyFile(join(source.dir, 'sync.sqlite3'), join(dir, 'sync.sqlite3'));
   } });
   const target = destination.server.syncUrl, targetAdmin = await admin(destination.server);
   const migrationCode = await issue(targetAdmin, 42);
@@ -424,12 +475,17 @@ test('primary credentials bind another device, follow ownership transfer and res
   }, auth(oldMain.values.device))).status, 200);
   const beforeExpiry = await targetAdmin.send('revoke', { type: 'account', id: main });
   assert.equal(beforeExpiry.status, 200);
-  for (const name of ['store.json', 'store.json.ledger']) assert.ok(Object.hasOwn(JSON.parse(await readFile(join(destination.dir, name))), main));
+  const storedKinds = () => {
+    const db = new DatabaseSync(join(destination.dir, 'sync.sqlite3'), { readOnly: true });
+    try { return db.prepare('SELECT kind FROM sync_change_records WHERE stream = ? ORDER BY kind').all('private:' + main).map(row => row.kind); }
+    finally { db.close(); }
+  };
+  assert.deepEqual(storedKinds(), ['ledger', 'match']);
   destination.advance(30 * 86400000);
   await destination.server.settle();
   const afterExpiry = await admin(destination.server);
   assert.equal((await afterExpiry.send('private/restore-child', { id: main })).status, 409);
-  for (const name of ['store.json', 'store.json.ledger']) assert.ok(!Object.hasOwn(JSON.parse(await readFile(join(destination.dir, name))), main));
+  assert.deepEqual(storedKinds(), []);
   assert.equal((await switchTo(41, migrated.installation, target).response).status, 403);
   const freshPair = { ...bindBody(await privateInvite(target, afterExpiry), '41'), installation: token() };
   assert.equal((await post(target, '/v1/bind', freshPair)).status, 200);
@@ -441,7 +497,8 @@ test('public vault keeps record IDs open, authenticates ciphertext, merges concu
   let time = Date.now();
   const state = openState(':memory:', 0, () => time);
   try {
-    const vaults = openPublicVaults(state, () => time), entry = {
+    const changes = openSyncChanges(state);
+    const vaults = openPublicVaults(state, () => time, changes), entry = {
       origin: 'https://localhost:17429', vault: token(), seed: token(), credential: token(), password: randomPass(webcrypto),
     };
     const cipher = await createVaultCipher(webcrypto, entry);
@@ -449,6 +506,8 @@ test('public vault keeps record IDs open, authenticates ciphertext, merges concu
     assert.match(entry.password, /[A-Z]/);
     const post = async (_, path, body) => {
       if (path.endsWith('/register')) return vaults.register(body);
+      if (path.endsWith('/changes')) return vaults.changes(body);
+      if (path.endsWith('/backup')) return state.transaction(() => vaults.snapshot(body.vault));
       return vaults.exchange(body);
     };
     const first = createPublicTransport(webcrypto, post), second = createPublicTransport(webcrypto, post);
@@ -463,15 +522,27 @@ test('public vault keeps record IDs open, authenticates ciphertext, merges concu
     assert.equal(JSON.stringify(raw).includes('general'), false);
     assert.throws(() => vaults.exchange({ ...entry, credential: token(), revision: -1, records: [] }), /binding_required/);
     await assert.rejects(cipher.open([raw.records[0][0], '5555', raw.records[0][2]]));
+    const { cursor } = await first.exchange(entry, entry.origin, BACKUP_READ_PATH, {});
+    await second.exchange(entry, entry.origin, '/appearances/sync', { matches: [match('12347', [11])], uploadOnly: true });
+    const encryptedDelta = vaults.changes({ ...entry, after: cursor });
+    assert.equal(encryptedDelta.records.length, 1);
+    assert.equal(encryptedDelta.records[0][1], '12347');
+    assert.equal(typeof encryptedDelta.records[0][2], 'string');
+    assert.equal(JSON.stringify(encryptedDelta).includes('general'), false);
+    const delta = await first.exchange(entry, entry.origin, SYNC_CHANGES_PATH, { after: cursor });
+    const { gameId, ...details } = match('12347', [11]);
+    assert.deepEqual(delta.records, [['match', gameId, details]]);
+    assert.deepEqual(await first.exchange(entry, entry.origin, SYNC_CHANGES_PATH, { after: delta.cursor }),
+      { records: [], cursor: delta.cursor, more: false });
     const wrong = (await createVaultCipher(webcrypto, { ...entry, password: entry.password + '9' })).verifier;
     for (let i = 0; i < 49; i++) assert.throws(() => vaults.preview({ ...entry, verifier: wrong }, '192.0.2.1'), /invalid_view/);
     assert.throws(() => vaults.preview({ ...entry, verifier: wrong }, '192.0.2.1'), /view_locked/);
-    const restarted = openPublicVaults(state, () => time);
+    const restarted = openPublicVaults(state, () => time, changes);
     const correct = { vault: entry.vault, verifier: cipher.verifier };
     assert.throws(() => restarted.preview(correct, '192.0.2.1'), /view_locked/);
-    assert.equal(restarted.preview(correct, '192.0.2.2').records.length, 2);
+    assert.equal(restarted.preview(correct, '192.0.2.2').records.length, 3);
     time += 30 * 60000;
-    assert.equal(restarted.preview(correct, '192.0.2.1').records.length, 2);
+    assert.equal(restarted.preview(correct, '192.0.2.1').records.length, 3);
   } finally { state.close(); }
 });
 
@@ -545,6 +616,112 @@ test('the managed service keeps existing history and moves an explicitly linked 
   assert.equal(ledger.status, 200);
   assert.equal((await ledger.json()).download.events[0].id, event.id);
   assert.equal((await post(server.syncUrl, '/ledger/sync', { account: id, balances: [], events: [] })).status, 401);
+  const backup = () => post(server.syncUrl, '/v1/backup/read', { account: id }, headers).then(response => response.json());
+  assert.equal((await post(server.syncUrl, '/v1/backup/read', { account: gameKey('42') }, headers)).status, 403);
+  const { snapshot } = await backup();
+  assert.deepEqual(snapshot.matches, before);
+  assert.equal(snapshot.ledger.events[0].id, event.id);
+  assert.deepEqual(await backup(), { retryAfter: 3600000 });
+  await server.close();
+  server = await env.start();
+  env.advance(3599999);
+  assert.deepEqual(await backup(), { retryAfter: 1 });
+  env.advance(1);
+  assert.equal((await backup()).snapshot.matches[0].gameId, match.gameId);
+});
+
+test('incremental private sync pages late uploads, resumes after restart and leaves the full-backup quota alone', async t => {
+  const env = await fixture(t);
+  const operator = await admin(env.server);
+  const account = gameKey('41'), device = bindBody(await invite(operator));
+  const call = (path, payload) => post(env.server.syncUrl, path, { account, ...payload }, auth(device.device));
+  assert.equal((await call('/v1/bind', device)).status, 200);
+  const { cursor } = await (await call(BACKUP_READ_PATH, {})).json();
+  const match = number => ({ gameId: String(number), mode: 26, rawMode: 132, rawGroup: 3,
+    endedAt: env.now() - 86400000, duration: 120, result: 0, general: [1], position: 4 });
+  const events = [{ id: 'late-ledger-event', session: 'older-login', at: env.now() - 86400000,
+    kind: 'goods', source: 'DbsCcUserGoodshintNtf', type: 8, items: [{ id: 20260001, name: '祈福灯', delta: 7 }] }];
+  assert.equal((await call('/appearances/sync', {
+    matches: Array.from({ length: 130 }, (_, i) => match(300 + i)), uploadOnly: true,
+  })).status, 200);
+  assert.equal((await call('/ledger/sync', { balances: [], events, uploadOnly: true })).status, 200);
+  const pull = after => call(SYNC_CHANGES_PATH, { after }).then(response => {
+    assert.equal(response.status, 200);
+    return response.json();
+  });
+  const first = await pull(cursor);
+  assert.equal(first.more, true);
+  assert.equal(first.records.length, 128);
+  assert.ok(first.records.every(([kind]) => kind === 'match'));
+  assert.deepEqual(await pull(cursor), first);
+  await env.server.close();
+  await env.start();
+  assert.equal((await call('/v1/preferences/sync', {
+    groups: ['toolbox'], values: { toolbox: { compactOpacity: 100 } }, patch: true,
+  })).status, 200);
+  assert.equal((await call('/appearances/sync', { matches: [match(450)], uploadOnly: true })).status, 200);
+  const second = await pull(first.cursor);
+  assert.equal(second.more, false);
+  assert.deepEqual(second.records.map(([kind, id]) => [kind, id]),
+    [['match', '428'], ['match', '429'], ['ledger', 'details'], ['event', events[0].id], ['preferences', 'toolbox'], ['match', '450']]);
+  assert.equal(second.records.find(([kind]) => kind === 'event')[2].at, events[0].at);
+  assert.equal(second.records.find(([kind]) => kind === 'preferences')[2].compactOpacity, 100);
+  assert.deepEqual(await pull(second.cursor), { records: [], cursor: second.cursor, more: false });
+  assert.deepEqual(await pull({ ...cursor, epoch: token() }), { reset: true });
+  assert.deepEqual(await (await call(BACKUP_READ_PATH, {})).json(), { retryAfter: 3600000 });
+  assert.equal((await call(SYNC_CHANGES_PATH, { account: gameKey('42'), after: cursor })).status, 403);
+});
+
+test('private network HTTP serves pairing and backups through the restricted client transport', async t => {
+  const { server } = await fixture(t, { privateNetwork: true });
+  const operator = await admin(server), port = await freePort();
+  const address = `http://sync.example.test:${port}`;
+  assert.equal(privateSyncOrigin(address), address);
+  assert.throws(() => privateSyncOrigin(address + '/admin'));
+  assert.equal((await operator.send('network', { port, domain: 'sync.example.test', tls: false })).status, 200);
+  const call = (path, body, device, editHeaders = () => {}) => new Promise((resolve, reject) => {
+    const prepared = privateHttpRequest({ url: address + path, body: JSON.stringify(body), device }, site);
+    const headers = { ...prepared.headers, Host: new URL(address).host };
+    editHeaders(headers);
+    const request = httpRequest(`http://127.0.0.1:${port}${path}`, { method: 'POST', headers }, response => {
+      let text = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { text += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, value: JSON.parse(text) }));
+    });
+    request.on('error', reject);
+    request.end(prepared.body);
+  });
+  const request = await createPairingRequest(webcrypto);
+  const { status, value } = await call('/v1/private/request', { request: request.code });
+  assert.equal(status, 200);
+  const invite = await (await operator.send('private/invite', { pin: value.pin })).json();
+  const decoded = await openPairing(invite.code, PAIR_INVITE, () => request.keys);
+  assert.equal(decoded.domain, 'sync.example.test');
+  assert.equal(decoded.tls, false);
+  const nonce = token(16);
+  assert.equal((await call('/v1/proof', { nonce })).value.origin, address);
+  assert.equal((await call('/v1/proof', { nonce }, undefined, headers => { headers.Origin = 'https://other.example'; })).status, 403);
+  const device = token();
+  assert.equal((await call('/v1/bind', { ...bindBody({ request, decoded }), device, installation: token(), userCode: '41' })).status, 200);
+  const account = gameKey('41'), id = '0000000042';
+  const values = {
+    friends: { version: 1, pins: [id], friends: { [id]: { name: '好友', seenAt: 1 } }, changes: [] },
+    friendLamps: { version: 1, friends: { [id]: { name: '好友', ids: [1], names: {}, at: 1 } } },
+    pluginSettings: { 'social:onlyPasswordFreeRooms': true },
+  };
+  const groups = Object.keys(values);
+  const { value: { cursor } } = await call(BACKUP_READ_PATH, { account }, device);
+  assert.equal((await call('/v1/preferences/sync', { account, groups, values }, device)).status, 200);
+  assert.deepEqual((await call('/v1/preferences/sync', { account, groups }, device)).value, { values });
+  assert.equal((await call('/v1/preferences/sync', { account: gameKey('42'), groups }, device)).status, 403);
+  const delta = await call(BACKUP_READ_PATH, { account, after: cursor }, device);
+  assert.equal(delta.status, 200);
+  assert.deepEqual(delta.value.records, groups.map(group => ['preferences', group, values[group]]));
+  assert.ok((await call(BACKUP_READ_PATH, { account }, device)).value.retryAfter > 0);
+  assert.equal((await call('/ledger/sync', { account, balances: [], events: [] }, device)).status, 200);
+  assert.throws(() => privateHttpRequest({ url: address + '/admin/login', body: '{}' }, site));
+  assert.throws(() => privateHttpRequest({ url: address + '/v2/vault/register', body: '{}' }, site));
 });
 
 test('a staged local port needs an authenticated confirmation and persists the 60-minute grace period', async t => {
@@ -781,7 +958,9 @@ test('loopback TLS validates certificate names and restricts plaintext redirects
 
 test('HTTPS admin requires a password and limits sessions to the authenticated origin', async t => {
   const domain = 'sync.example.test';
-  const env = await fixture(t, { publicNetwork: true, privateNetwork: true, httpsAdmin: true });
+  const report = { sections: [] };
+  const env = await fixture(t, { publicNetwork: true, privateNetwork: true, httpsAdmin: true,
+    stargazingFetch: () => Response.json(report) });
   const certificate = await testCertificate(env.dir, domain);
   if (!certificate) return t.skip('OpenSSL CLI unavailable');
   const operator = await admin(env.server), port = await freePort();
@@ -836,6 +1015,13 @@ test('HTTPS admin requires a password and limits sessions to the authenticated o
   assert.equal((await secure('/admin/status', null, { Cookie, 'Sec-Fetch-Site': 'cross-site' })).status, 403);
   assert.equal((await secure('/admin/public/limit', { limit: 3 }, { Cookie, Origin: site })).status, 403);
   assert.equal((await secure('/admin/public/limit', { limit: 10 }, { Cookie })).status, 200);
+  const vault = { vault: token(), credential: token(), verifier: token() };
+  const client = { Origin: site };
+  assert.equal((await secure(STARGAZING_SYNC_PATH, {}, client)).status, 401);
+  assert.equal((await secure('/v2/vault/register', vault, client)).status, 200);
+  assert.deepEqual(JSON.parse((await secure(STARGAZING_SYNC_PATH, vault, client)).text), report);
+  assert.equal((await secure('/admin/stargazing', { enabled: false }, { Cookie })).status, 200);
+  assert.equal((await secure(STARGAZING_SYNC_PATH, vault, client)).status, 409);
 
   for (let i = 0; i < 10; i++) assert.equal((await secure('/admin/login', { token: token() })).status, 401);
   assert.equal((await secure('/admin/login', { token: password })).status, 429);
