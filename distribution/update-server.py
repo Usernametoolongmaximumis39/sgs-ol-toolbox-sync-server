@@ -49,18 +49,34 @@ def latest():
         raise ValueError("GitHub 未提供正式版本")
     asset = next((item for item in data["assets"] if item["name"] == ASSET), None)
     url = f"https://github.com/{REPO}/releases/download/{tag}/{ASSET}"
-    if (not asset or asset["browser_download_url"] != url or not 0 < asset["size"] <= MAX_DOWNLOAD
+    if (not asset or not isinstance(asset.get("id"), int) or asset["id"] <= 0
+            or asset["browser_download_url"] != url or not 0 < asset["size"] <= MAX_DOWNLOAD
             or not re.fullmatch(r"sha256:[a-f0-9]{64}", asset.get("digest") or "")):
         raise ValueError("GitHub 正式附件缺少可用的大小或摘要")
     return tag, asset
 
 
 def download(asset, target):
-    digest = hashlib.sha256()
-    length = 0
+    api = f"https://api.github.com/repos/{REPO}/releases/assets/{asset['id']}"
     opener = build_opener(ReleaseRedirect)
     deadline = time.monotonic() + 300
-    with opener.open(asset["browser_download_url"], timeout=30) as source, target.open("xb") as output:
+    for url in (api, api, asset["browser_download_url"]):
+        request = Request(url, headers={"Accept": "application/octet-stream", "User-Agent": "sgs-sync-server-updater"})
+        try:
+            download_from(opener, request, asset, target, deadline)
+            return
+        except OSError as error:
+            cause = error
+            target.unlink(missing_ok=True)
+    raise RuntimeError("连接 GitHub 发布附件失败，请重试") from cause
+
+
+def download_from(opener, request, asset, target, deadline):
+    digest = hashlib.sha256()
+    length = 0
+    with opener.open(request, timeout=45) as source, target.open("xb") as output:
+        if source.headers.get_content_type() == "application/json":
+            raise OSError("The GitHub asset API did not return the archive")
         while chunk := source.read(65536):
             length += len(chunk)
             if length > asset["size"] or time.monotonic() > deadline:

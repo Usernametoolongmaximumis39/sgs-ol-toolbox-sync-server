@@ -26,6 +26,24 @@ def bundle(path, entries):
 
 
 class ServerUpdaterTest(unittest.TestCase):
+    def test_retries_transport_and_removes_partial_download(self):
+        with tempfile.TemporaryDirectory() as work:
+            target = Path(work) / "release.tar.gz"
+            asset = {"id": 42, "browser_download_url": "https://github.com/example", "digest": "sha256:" + "a" * 64}
+            urls = []
+
+            def attempt(_opener, request, _asset, destination, _deadline):
+                urls.append(request.full_url)
+                self.assertFalse(destination.exists())
+                destination.write_bytes(b"test")
+                if len(urls) < 3:
+                    raise TimeoutError("transport unavailable")
+
+            with patch.object(updater, "download_from", side_effect=attempt):
+                updater.download(asset, target)
+            self.assertEqual(urls, [f"https://api.github.com/repos/{updater.REPO}/releases/assets/42"] * 2
+                             + [asset["browser_download_url"]])
+
     def test_extracts_named_version_without_accepting_traversal(self):
         with tempfile.TemporaryDirectory() as work:
             root = Path(work)
