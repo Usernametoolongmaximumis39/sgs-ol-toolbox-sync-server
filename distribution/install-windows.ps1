@@ -17,7 +17,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw 'Open 64-bit PowerShell as Administrator.'
 }
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'This installer requires x64 Windows and 64-bit PowerShell.' }
-if ($SyncPort -eq $AdminPort -or $SetupPort -eq $SyncPort -or $SetupPort -eq $AdminPort) { throw 'Ports must differ.' }
+if ($SyncPort -eq $AdminPort -or ($HostName -and ($SetupPort -eq $SyncPort -or $SetupPort -eq $AdminPort))) { throw 'Ports must differ.' }
 
 $root = Join-Path $env:ProgramFiles $ServiceName
 $data = Join-Path $root 'data'
@@ -125,17 +125,20 @@ function Install-OrReset {
     }
 
     if (-not $old) {
-        if (-not $HostName) { throw 'Pass -HostName with the public IPv4 address or DNS name of this server.' }
-        $script:HostName = $HostName.ToLowerInvariant()
-        $dns = '^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
-        $ipv4 = '^\d{1,3}(?:\.\d{1,3}){3}$'
-        if ($HostName.Length -gt 253 -or $HostName -cnotmatch $dns -or
-            ($HostName -match '^[0-9.]+$' -and ($HostName -notmatch $ipv4 -or
-                @($HostName.Split('.') | Where-Object { [int]$_ -gt 255 -or ([int]$_).ToString() -ne $_ }).Count))) {
-            throw 'Invalid -HostName. Use a public IPv4 address or DNS name, without a scheme or port.'
+        $ports = @($SyncPort, $AdminPort)
+        if ($HostName) {
+            $script:HostName = $HostName.ToLowerInvariant()
+            $dns = '^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
+            $ipv4 = '^\d{1,3}(?:\.\d{1,3}){3}$'
+            if ($HostName.Length -gt 253 -or $HostName -cnotmatch $dns -or
+                ($HostName -match '^[0-9.]+$' -and ($HostName -notmatch $ipv4 -or
+                    @($HostName.Split('.') | Where-Object { [int]$_ -gt 255 -or ([int]$_).ToString() -ne $_ }).Count))) {
+                throw 'Invalid -HostName. Use a public IPv4 address or DNS name, without a scheme or port.'
+            }
+            $ports += $SetupPort
         }
-        foreach ($port in $SyncPort, $AdminPort, $SetupPort) {
-            $address = if ($port -eq $SetupPort) { [Net.IPAddress]::Any } else { [Net.IPAddress]::Loopback }
+        foreach ($port in $ports) {
+            $address = if ($HostName -and $port -eq $SetupPort) { [Net.IPAddress]::Any } else { [Net.IPAddress]::Loopback }
             $listener = [Net.Sockets.TcpListener]::new($address, $port)
             try { $listener.Start() } finally { $listener.Stop() }
         }
@@ -189,8 +192,8 @@ function Install-OrReset {
         Get-ChildItem -LiteralPath $app -Force | Copy-Item -Destination $release -Recurse
         $control = Join-Path $root 'install-windows.ps1'
         Copy-Item -LiteralPath (Join-Path $release 'distribution\install-windows.ps1') -Destination $control -Force
-        if (-not $old) {
-            $password = New-Password $release $runtime
+        if (-not $old) { $password = New-Password $release $runtime }
+        if (-not $old -and $HostName) {
             $setupCode = & $runtime (Join-Path $release 'tools\appearance-sync.mjs') --data-dir $data --create-setup-code
             if ($LASTEXITCODE -or $setupCode -cnotmatch '^[A-Za-z0-9_-]{43}$') { throw 'Initial setup code creation failed.' }
         }
@@ -198,7 +201,7 @@ function Install-OrReset {
         try {
             Start-Server $release $runtime
             Wait-Admin
-            if (-not $old) {
+            if (-not $old -and $HostName) {
                 $authority = if ($SetupPort -eq 80) { $HostName } else { "${HostName}:$SetupPort" }
                 $firstPage = & curl.exe --fail --silent --noproxy '*' --max-time 5 -H "Host: $authority" "http://127.0.0.1:$SetupPort/admin/"
                 if ($LASTEXITCODE -or -not ($firstPage -match 'data-initial-setup')) { throw 'The initial setup page failed its startup check.' }
@@ -211,8 +214,9 @@ function Install-OrReset {
             if ($old) { Stop-Server; Start-Server $old.release $old.runtime }
             throw
         }
-        Write-Host "Installed server v$version"
-        if (-not $old) {
+        $description = if ($old) { "Installed server v$version" } else { "Installed server v$version (private mode)" }
+        Write-Host $description
+        if (-not $old -and $HostName) {
             Write-Host "First setup link (HTTP, 60 minutes): http://${HostName}:$SetupPort/admin/"
             Write-Host "Setup TCP port: $SetupPort (allow your public client IP in the cloud and Windows firewalls)"
             Write-Host "First setup code: $setupCode"

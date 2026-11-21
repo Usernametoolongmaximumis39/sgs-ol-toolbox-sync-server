@@ -122,7 +122,8 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
   const publicMode = () => store.get('mode') === 'public';
   const externalSync = () => publicMode() ? publicNetwork : privateNetwork;
   const externalEndpoint = config => externalSync() && !isLocalDomain(config.domain) && (config.tls || !publicMode());
-  const publicConfig = () => [candidate?.config, active?.config].find(config => config?.tls);
+  const publicConfig = () => [candidate, active].find(listener => listener?.enabled && listener.server.listening && listener.config.tls)?.config;
+  const httpsReady = config => Boolean(config && Date.parse(config.certificateExpires) > now());
   const canPreview = () => publicMode() && store.get('publicPreview') !== false;
   const snapshot = key => {
     const dataSnapshot = data.snapshot(key);
@@ -213,7 +214,10 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
       const external = externalEndpoint(current);
       const authorities = current.domain && (current.tls || external) ? origins.slice(0, 1) : origins;
       checkHost(request, authorities.map(origin => new URL(origin).host), external);
-      if (publicMode() && !current.tls) return redirectToHttps(request, response, publicConfig());
+      const tls = publicConfig();
+      // A private client can still discover the signed HTTPS address before migrating its history.
+      const discovery = !publicMode() && request.method === 'POST' && request.url === '/v1/proof';
+      if (!current.tls && (publicMode() || tls && !discovery)) return redirectToHttps(request, response, tls);
       const browserOrigin = request.headers.origin;
       const bridgeOrigin = request.headers[SYNC_SOURCE_HEADER.toLowerCase()];
       const usingBridge = !current.tls && external && request.method === 'POST' && allowedOrigins.has(bridgeOrigin) &&
@@ -421,7 +425,7 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
   async function changeNetwork(input) {
     requireValue(!network.candidate, 'migration_in_progress', 409);
     const config = validateConfig(input, active.config, externalSync(), !publicMode());
-    requireValue(!publicMode() || config.tls, 'https_required', 426);
+    requireValue(!(publicMode() || publicConfig()) || config.tls, 'https_required', 426);
     requireValue(!publicMode() || !publicNetwork || !isLocalDomain(config.domain) && !isIPv4(config.domain), 'public_domain_required');
     const adminPort = admin.address().port;
     const reserved = [adminPort, initialSetup && setupPort];
@@ -466,8 +470,9 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
     const serverUpdateStatus = await serverUpdate.status();
     const staged = network.candidate;
     const shared = publicMode(), tls = publicConfig();
-    const updateEndpoint = shared && !active.config.tls ? tls : active.config;
-    const base = { mode: shared ? 'public' : 'private', publicUrl: tls ? endpointUrl(tls) : null, initialSetup: setup, publicNetwork,
+    const updateEndpoint = (shared || tls) && !active.config.tls ? tls : active.config;
+    const base = { mode: shared ? 'public' : 'private', publicUrl: tls ? endpointUrl(tls) : null,
+      httpsRequired: shared || Boolean(tls), httpsReady: httpsReady(tls), initialSetup: setup, publicNetwork,
       activeEndpoint: statusOf(network.active),
       candidate: staged ? { ...statusOf(staged.config), listening: Boolean(candidate), confirmedAt: staged.confirmedAt,
         deadline: staged.confirmedAt === null ? null : staged.confirmedAt + grace, error: migrationError } : null };
@@ -579,8 +584,9 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
           await purgeRemoved();
           await data.serialize(async () => {
             requireValue(!publicMode(), 'public_mode_required', 409);
-            requireValue(publicConfig(), 'https_required', 426);
-            requireValue(!publicNetwork || !isLocalDomain(publicConfig().domain) && !isIPv4(publicConfig().domain), 'public_domain_required', 400);
+            const tls = publicConfig();
+            requireValue(httpsReady(tls), 'https_required', 426);
+            requireValue(!publicNetwork || !isLocalDomain(tls.domain) && !isIPv4(tls.domain), 'public_domain_required', 400);
             requireValue(!store.archivedStores().length, 'recovery_pending', 409);
             requireValue(migrationStatus().every(row => row.ready), 'history_not_staged', 409);
             store.transaction(() => {

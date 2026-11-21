@@ -28,7 +28,7 @@ const messages = {
   recovery_expired: '该账号已超过 30 天恢复期',
   recovery_pending: '请先恢复已移除的账号，或等待恢复期结束',
   history_not_staged: '仍有历史账号未上传最新的加密副本',
-  https_required: '请先配置可用的 HTTPS 端口',
+  https_required: '请先配置有效的 SSL 证书并启动 HTTPS 端口',
   public_domain_required: '启用外网访问时需要有效的公网域名和对应证书',
   confirmation_required: '请输入「转为公共」确认',
   public_mode_required: '公共服务器使用加密存储',
@@ -301,9 +301,9 @@ function renderSetup(state, resetSettings) {
   $('migration').hidden = !candidate || shared;
   $('candidate').textContent = candidate ? '新 HTTPS 端口 ' + candidate.port : '';
   $('save-network').disabled = Boolean(candidate);
-  canConvert = Boolean(state.publicUrl) && !state.used;
+  canConvert = state.httpsReady && !state.used;
   $('enable-public-button').disabled = !canConvert;
-  $('transition-readiness').textContent = canConvert ? 'HTTPS 已就绪。' : '请先配置 HTTPS 证书和端口。';
+  $('transition-readiness').textContent = canConvert ? 'HTTPS 已强制启用，可以转为公共服务器。' : '请先配置有效的 SSL 证书和 HTTPS 端口。';
   if (resetSettings) {
     fillNetwork(candidate || { ...active, port: 8888, tls: true });
     $('tls').disabled = true;
@@ -322,15 +322,15 @@ function render(state, resetSettings = false) {
   $('private-mode').hidden = $('installation-card').hidden = shared;
   $('public-mode').hidden = !shared;
   $('server-mode').textContent = shared ? '公共' : '私有';
-  $('network-scope').textContent = shared ? '强制 HTTPS' : state.privateNetwork ? '可配置网络访问' : '仅本机';
+  $('network-scope').textContent = state.httpsRequired ? '强制 HTTPS' : state.privateNetwork ? '可配置网络访问' : '仅本机';
   $('public-url').value = state.publicUrl || '';
   toggle('public-preview', state.publicPreview);
-  canConvert = Boolean(state.publicUrl) && !state.recoveryPending && state.migration.every(row => row.ready);
+  canConvert = state.httpsReady && !state.recoveryPending && state.migration.every(row => row.ready);
   $('enable-public-button').disabled = !canConvert;
-  $('transition-readiness').textContent = !state.publicUrl ? '请先配置 HTTPS 证书和端口。'
+  $('transition-readiness').textContent = !state.httpsReady ? '请先配置有效的 SSL 证书和 HTTPS 端口。'
     : state.recoveryPending ? '有账号处于 30 天恢复期。恢复账号或等待恢复期结束后可转换。'
     : state.migration.some(row => !row.ready) ? '用有历史的游戏账号登录工具箱，在「云同步」里准备转换，直至所有账号就绪。'
-      : 'HTTPS 与已有历史均已就绪。';
+      : 'HTTPS 已强制启用，已有历史均已就绪。';
   $('credential-panel').hidden = !state.primaryReady;
   $('private-upgrade').hidden = !waitingForUpdate;
   $('invite').hidden = $('pairing-hint').hidden = waitingForUpdate;
@@ -346,8 +346,8 @@ function render(state, resetSettings = false) {
   if (shared) $('issued').hidden = $('updated').hidden = true;
   const active = state.activeEndpoint, candidate = state.candidate;
   showCertificate(active, candidate);
-  $('active-address').textContent = shared && !active.tls
-    ? `公共同步 ${state.publicUrl} · 旧 HTTP 端口 ${active.port} 等待退役`
+  $('active-address').textContent = state.httpsRequired && !active.tls && state.publicUrl
+    ? `HTTPS 同步 ${state.publicUrl} · 旧 HTTP 端口 ${active.port} 等待退役`
     : `当前 ${active.tls ? 'HTTPS' : 'HTTP'} · ${active.domain || '127.0.0.1'}:${active.port}`;
   const updates = state.updates;
   toggle('mirror', Boolean(updates?.enabled));
@@ -361,7 +361,7 @@ function render(state, resetSettings = false) {
   showServerUpdate(state.serverUpdate);
   $('migration').hidden = !candidate;
   $('cancel-migration').disabled = shared && !active.tls;
-  $('tls').disabled = shared;
+  $('tls').disabled = state.httpsRequired;
   $('save-network').disabled = Boolean(candidate);
   if (candidate) {
     const status = candidate.error ? messages[candidate.error] ?? '等待恢复'

@@ -1,6 +1,6 @@
 import http from 'node:http';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { mkdir, readFile, realpath, rename, writeFile } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { LEDGER_PREVIEW_PATH as previewPath, LEDGER_SYNC_PATH as ledgerEndpoint, MATCH_SYNC_PATH } from '../src/shared/sync-paths.js';
 import { MATCH_SYNC_LIMIT, MATCH_SYNC_BYTES, projectSyncMatch, sameSyncMatch } from '../src/plugins/appearances/match-sync.js';
@@ -227,6 +227,7 @@ async function runCli() {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+const mainPath = process.argv[1] && await realpath(process.argv[1]).catch(() => null);
+if (mainPath && import.meta.url === pathToFileURL(mainPath).href) {
   void runCli().catch(error => { console.error(error.message); process.exitCode = 1; });
 }

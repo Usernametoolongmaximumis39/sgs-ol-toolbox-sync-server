@@ -14,19 +14,19 @@ jobs:
           set -euo pipefail
           base=https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/releases/latest/download
           curl -fsSL --retry 3 "$base/install-linux.sh" -o /tmp/install-sgs.sh
-          if ! install=$(sudo sh /tmp/install-sgs.sh --host 127.0.0.1); then
+          if ! install=$(sudo sh /tmp/install-sgs.sh); then
             sudo journalctl -u sgs-toolbox-sync -n 40 --no-pager
             exit 1
           fi
-          setup_code=$(printf '%s\n' "$install" | sed -n 's/^First setup code: //p')
           admin_password=$(printf '%s\n' "$install" | sed -n 's/^Initial admin password: //p')
-          [[ "$setup_code" =~ ^[A-Za-z0-9_-]{43}$ && "$admin_password" =~ ^A1[A-Za-z0-9_-]{43}$ ]]
+          [[ "$admin_password" =~ ^A1[A-Za-z0-9_-]{43}$ && "$install" != *'First setup code:'* ]]
+          curl -fsS http://127.0.0.1:17429/health | grep -q '"mode":"private"'
+          if curl --silent --fail --max-time 2 http://127.0.0.1:17431/admin/; then exit 1; fi
           login() {
             local port=$1 secret=$2
             curl -fsS -H "Origin: http://127.0.0.1:$port" -H 'Content-Type: application/json' \
               --data "{\"token\":\"$secret\"}" "http://127.0.0.1:$port/admin/login" >/dev/null
           }
-          login 17431 "$setup_code"
           login 17430 "$admin_password"
           if ! reset=$(sudo /opt/sgs-toolbox-sync/reset-admin-password); then
             sudo journalctl -u sgs-toolbox-sync -n 40 --no-pager
@@ -35,6 +35,11 @@ jobs:
           reset=${reset#New admin password: }
           [[ "$reset" =~ ^A1[A-Za-z0-9_-]{43}$ && "$reset" != "$admin_password" ]]
           login 17430 "$reset"
+          setup=$(sudo sh /tmp/install-sgs.sh --host 127.0.0.1 --service-name sgs-sync-setup-test --sync-port 18429 --admin-port 18430 --setup-port 18431)
+          setup_code=$(printf '%s\n' "$setup" | sed -n 's/^First setup code: //p')
+          [[ "$setup_code" =~ ^[A-Za-z0-9_-]{43}$ ]]
+          login 18431 "$setup_code"
+          curl -fsS http://127.0.0.1:18429/health | grep -q '"mode":"private"'
 
   windows:
     runs-on: windows-2022
@@ -46,7 +51,7 @@ jobs:
           $installer = Join-Path $env:TEMP 'install-sgs.ps1'
           $base = 'https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/releases/latest/download'
           Invoke-WebRequest -Uri "$base/install-windows.ps1" -OutFile $installer
-          $results = @(powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -HostName '127.0.0.1')
+          $results = @(powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer)
           if ($LASTEXITCODE) { throw 'Windows install failed.' }
           function Read-Secret($Lines, $Label) {
             foreach ($line in $Lines) { if ($line -match "^$Label ([A-Za-z0-9_-]{43,45})$") { return $Matches[1] } }
@@ -58,7 +63,8 @@ jobs:
             $result = Invoke-RestMethod "$origin/admin/login" -Method Post -ContentType 'application/json' -Headers @{ Origin = $origin } -Body $body
             if (-not $result.ok) { throw "Login failed on TCP $Port" }
           }
-          Test-Login 17431 (Read-Secret $results 'First setup code:')
+          if ($results -match '^First setup code:') { throw 'Default install started the public first-setup listener.' }
+          if ((Invoke-RestMethod 'http://127.0.0.1:17429/health').mode -ne 'private') { throw 'Default mode is not private.' }
           $admin = Read-Secret $results 'Initial admin password:'
           Test-Login 17430 $admin
           $control = Join-Path $env:ProgramFiles 'sgs-toolbox-sync\install-windows.ps1'
@@ -67,3 +73,7 @@ jobs:
           $newPassword = Read-Secret $reset 'New admin password:'
           if ($newPassword -eq $admin) { throw 'Password did not change.' }
           Test-Login 17430 $newPassword
+          $setup = @(powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -HostName '127.0.0.1' -ServiceName 'sgs-sync-setup-test' -SyncPort 18429 -AdminPort 18430 -SetupPort 18431)
+          if ($LASTEXITCODE) { throw 'Windows first-setup install failed.' }
+          Test-Login 18431 (Read-Secret $setup 'First setup code:')
+          if ((Invoke-RestMethod 'http://127.0.0.1:18429/health').mode -ne 'private') { throw 'Setup changed the server mode.' }

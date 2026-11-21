@@ -2,11 +2,11 @@ import assert from 'node:assert/strict';
 import { createHash, randomBytes, webcrypto } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { copyFile, mkdtemp, readFile, readdir, rmdir, unlink, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, readFile, readdir, rmdir, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { startAppearanceSync } from '../tools/appearance-sync.mjs';
@@ -154,11 +154,14 @@ test('HPKE invitations preserve endpoint fields and require the device key', asy
   });
 });
 
-test('the existing sync command starts the managed service', { timeout: 8000 }, async t => {
+test('the managed sync command starts via the current-release symlink with private loopback defaults', { timeout: 8000 }, async t => {
   const dir = await mkdtemp(join(tmpdir(), 'sgs-sync-cli-'));
-  const syncPort = await freePort(), adminPort = await freePort();
+  const syncPort = await freePort(), adminPort = await freePort(), setupPort = await freePort();
   const entry = fileURLToPath(new URL('../tools/appearance-sync.mjs', import.meta.url));
-  const child = spawn(process.execPath, [entry, '--data-dir', dir, '--port', syncPort, '--admin-port', adminPort],
+  const current = join(dir, 'current');
+  await symlink(dirname(entry), current, 'junction');
+  const child = spawn(process.execPath, [join(current, 'appearance-sync.mjs'), '--data-dir', dir, '--port', syncPort, '--admin-port', adminPort,
+    '--setup-port', setupPort],
     { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
   const exit = once(child, 'exit');
   t.after(async () => {
@@ -176,8 +179,11 @@ test('the existing sync command starts the managed service', { timeout: 8000 }, 
     if (output.includes(`http://127.0.0.1:${adminPort}/admin/`)) resolve();
   }));
   await Promise.race([started, exit.then(() => { throw new Error(errors || 'Sync command exited before startup'); })]);
-  assert.equal((await fetch(`http://127.0.0.1:${syncPort}/health`)).status, 200);
+  const health = await fetch(`http://127.0.0.1:${syncPort}/health`);
+  assert.equal(health.status, 200);
+  assert.equal((await health.json()).mode, 'private');
   assert.equal((await fetch(`http://127.0.0.1:${adminPort}/admin/`)).status, 200);
+  await assert.rejects(fetch(`http://127.0.0.1:${setupPort}/admin/`));
   assert.equal(output.includes((await readFile(join(dir, 'admin-token'), 'utf8')).trim()), false);
 });
 
@@ -677,7 +683,12 @@ test('loopback TLS validates certificate names and restricts plaintext redirects
   const initial = await invite(operator), registration = bindBody(initial);
   assert.equal((await post(env.server.syncUrl, '/v1/bind', registration)).status, 200);
   assert.equal((await operator.send('network', { port, tls: true, domain: 'other.localhost', cert, key })).status, 400);
+  assert.equal((await operator.send('public/enable', { confirm: '转为公共' })).status, 426);
   assert.equal((await operator.send('network', { port, tls: true, cert, key, redirectPort })).status, 200);
+  assert.equal((await post(env.server.syncUrl, '/v1/bind', {})).status, 426);
+  const discovery = await post(env.server.syncUrl, '/v1/proof', { nonce: token(16) });
+  assert.equal(discovery.status, 200);
+  assert.equal((await discovery.json()).next, `https://127.0.0.1:${port}`);
   const secure = (port, path, data) => new Promise((resolve, reject) => {
     const body = data && JSON.stringify(data);
     const request = httpsRequest(`https://127.0.0.1:${port}${path}`, { ca: cert, method: body ? 'POST' : 'GET',
@@ -698,6 +709,9 @@ test('loopback TLS validates certificate names and restricts plaintext redirects
   assert.equal((await post(redirect, '/v1/bind', {})).status, 426);
   const status = await (await operator.get('/admin/status')).json();
   assert.equal(status.candidate.tls, true);
+  assert.equal(status.mode, 'private');
+  assert.equal(status.httpsReady, true);
+  assert.equal(status.httpsRequired, true);
   assert.equal(JSON.stringify(status).includes('PRIVATE KEY'), false);
   const migrate = async port => {
     const { body } = await secure(port, '/v1/proof', { nonce: token(16) });
@@ -711,6 +725,8 @@ test('loopback TLS validates certificate names and restricts plaintext redirects
   assert.equal((await fetch(redirect + '/health', { redirect: 'manual' })).headers.get('location'), `https://127.0.0.1:${port}/health`);
   await migrate(nextPort);
   assert.equal((await fetch(redirect + '/health', { redirect: 'manual' })).headers.get('location'), `https://127.0.0.1:${nextPort}/health`);
+  env.advance(3 * 86400_000);
+  assert.equal((await (await admin(env.server)).send('public/enable', { confirm: '转为公共' })).status, 426);
 });
 
 test('HTTPS admin requires a password and limits sessions to the authenticated origin', async t => {

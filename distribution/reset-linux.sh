@@ -10,6 +10,7 @@ systemctl stop "$service"
 trap 'systemctl start "$service"' EXIT
 password=$(runuser -u "$service" -- "$root/runtime/node" "$root/current/tools/appearance-sync.mjs" \
     --data-dir "/var/lib/$service" --reset-admin-password)
+printf '%s\n' "$password" | grep -Eq '^A1[A-Za-z0-9_-]{43}$'
 printf 'New admin password: %s\n' "$password"
 systemctl start "$service"
 trap - EXIT
