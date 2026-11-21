@@ -17,7 +17,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw 'Open 64-bit PowerShell as Administrator.'
 }
 if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'This installer requires x64 Windows and 64-bit PowerShell.' }
-if ($SyncPort -eq $AdminPort -or ($HostName -and ($SetupPort -eq $SyncPort -or $SetupPort -eq $AdminPort))) { throw 'Ports must differ.' }
+if ($SyncPort -eq $AdminPort -or $SetupPort -eq $SyncPort -or $SetupPort -eq $AdminPort) { throw 'Ports must differ.' }
 
 $root = Join-Path $env:ProgramFiles $ServiceName
 $data = Join-Path $root 'data'
@@ -63,7 +63,8 @@ function New-Password($Release, $Runtime) {
 function Start-Server($Release, $Runtime) {
     $entry = Join-Path $Release 'tools\appearance-sync.mjs'
     $arguments = '"{0}" --data-dir "{1}" --port {2} --admin-port {3} --private-network --public-network --https-admin' -f $entry, $data, $SyncPort, $AdminPort
-    if ($HostName) { $arguments += " --setup-host $HostName --setup-port $SetupPort" }
+    $arguments += " --http-admin --setup-port $SetupPort"
+    if ($HostName) { $arguments += " --setup-host $HostName" }
     $action = New-ScheduledTaskAction -Execute $Runtime -Argument $arguments -WorkingDirectory $Release
     $account = $localService.Translate([Security.Principal.NTAccount]).Value
     $identity = New-ScheduledTaskPrincipal -UserId $account -LogonType ServiceAccount -RunLevel Limited
@@ -95,8 +96,7 @@ function Wait-Admin {
 
 function Show-Access {
     Write-Host ''
-    Write-Host "Local admin login (open on the server via RDP): http://127.0.0.1:$AdminPort/admin/"
-    Write-Host "Admin TCP port: $AdminPort (loopback only)"
+    Write-Host "Local recovery URL (on the server): http://127.0.0.1:$AdminPort/admin/"
     Write-Host "Initial sync TCP port: $SyncPort (loopback only)"
     Write-Host 'Public sync and HTTPS admin: configure a domain, certificate and separate TCP port in the panel (e.g. 8888).'
     Write-Host ("Password reset (Administrator PowerShell): & '{0}\install-windows.ps1' -ResetPassword -ServiceName '{1}'" -f $root, $ServiceName)
@@ -125,7 +125,7 @@ function Install-OrReset {
     }
 
     if (-not $old) {
-        $ports = @($SyncPort, $AdminPort)
+        $ports = @($SyncPort, $AdminPort, $SetupPort)
         if ($HostName) {
             $script:HostName = $HostName.ToLowerInvariant()
             $dns = '^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$'
@@ -135,10 +135,9 @@ function Install-OrReset {
                     @($HostName.Split('.') | Where-Object { [int]$_ -gt 255 -or ([int]$_).ToString() -ne $_ }).Count))) {
                 throw 'Invalid -HostName. Use a public IPv4 address or DNS name, without a scheme or port.'
             }
-            $ports += $SetupPort
         }
         foreach ($port in $ports) {
-            $address = if ($HostName -and $port -eq $SetupPort) { [Net.IPAddress]::Any } else { [Net.IPAddress]::Loopback }
+            $address = if ($port -eq $SetupPort) { [Net.IPAddress]::Any } else { [Net.IPAddress]::Loopback }
             $listener = [Net.Sockets.TcpListener]::new($address, $port)
             try { $listener.Start() } finally { $listener.Stop() }
         }
@@ -193,16 +192,20 @@ function Install-OrReset {
         $control = Join-Path $root 'install-windows.ps1'
         Copy-Item -LiteralPath (Join-Path $release 'distribution\install-windows.ps1') -Destination $control -Force
         if (-not $old) { $password = New-Password $release $runtime }
-        if (-not $old -and $HostName) {
+        if (-not $old) {
             $setupCode = & $runtime (Join-Path $release 'tools\appearance-sync.mjs') --data-dir $data --create-setup-code
             if ($LASTEXITCODE -or $setupCode -cnotmatch '^[A-Za-z0-9_-]{43}$') { throw 'Initial setup code creation failed.' }
         }
-        if ($old) { Stop-Server }
+        if ($old) {
+            $previousTask = Export-ScheduledTask -TaskName $ServiceName
+            Stop-Server
+        }
         try {
             Start-Server $release $runtime
             Wait-Admin
-            if (-not $old -and $HostName) {
-                $authority = if ($SetupPort -eq 80) { $HostName } else { "${HostName}:$SetupPort" }
+            if (-not $old) {
+                $authority = if ($HostName) { $HostName } else { '127.0.0.1' }
+                if ($SetupPort -ne 80) { $authority += ":${SetupPort}" }
                 $firstPage = & curl.exe --fail --silent --noproxy '*' --max-time 5 -H "Host: $authority" "http://127.0.0.1:$SetupPort/admin/"
                 if ($LASTEXITCODE -or -not ($firstPage -match 'data-initial-setup')) { throw 'The initial setup page failed its startup check.' }
             }
@@ -211,15 +214,28 @@ function Install-OrReset {
             if ($old) { [IO.File]::Replace("$settingsFile.tmp", $settingsFile, "$settingsFile.previous") }
             else { [IO.File]::Move("$settingsFile.tmp", $settingsFile) }
         } catch {
-            if ($old) { Stop-Server; Start-Server $old.release $old.runtime }
+            if ($old) {
+                Stop-Server
+                Register-ScheduledTask -TaskName $ServiceName -Xml $previousTask -Force | Out-Null
+                Start-ScheduledTask -TaskName $ServiceName
+            }
             throw
         }
         $description = if ($old) { "Installed server v$version" } else { "Installed server v$version (private mode)" }
         Write-Host $description
-        if (-not $old -and $HostName) {
-            Write-Host "First setup link (HTTP, 60 minutes): http://${HostName}:$SetupPort/admin/"
-            Write-Host "Setup TCP port: $SetupPort (allow your public client IP in the cloud and Windows firewalls)"
+        if (-not $old) {
+            $shownHost = $HostName
+            if (-not $shownHost) {
+                $ip = & curl.exe -4fs --max-time 5 'https://api.ipify.org'
+                $parsed = $null
+                if ($LASTEXITCODE -eq 0 -and [Net.IPAddress]::TryParse([string]$ip, [ref]$parsed) -and
+                    $parsed.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) { $shownHost = $parsed.ToString() }
+                else { $shownHost = 'SERVER_PUBLIC_IP_OR_DNS' }
+            }
+            Write-Host "HTTP admin link: http://${shownHost}:$SetupPort/admin/"
+            Write-Host "HTTP admin TCP port: $SetupPort (allow your public client IP in the cloud and Windows firewalls)"
             Write-Host "First setup code: $setupCode"
+            Write-Host 'The setup code lasts 60 minutes. The HTTP admin link stays active.'
         }
         Show-Access
         if ($old) { Write-Host 'Existing password retained.' }

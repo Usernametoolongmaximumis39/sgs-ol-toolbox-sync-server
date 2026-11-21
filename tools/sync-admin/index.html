@@ -4,8 +4,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>账本与战绩同步</title>
-  <link rel="stylesheet" href="/admin/style.css">
-  <script type="module" src="/admin/app.js"></script>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.js"></script>
 </head>
 <body>
   <main>
@@ -20,6 +20,7 @@
       <button class="primary">登录</button>
     </form>
     <p id="notice" class="message" role="status" hidden></p>
+    <a id="entry-recovery" hidden>打开 HTTPS 管理面板</a>
     <div id="dashboard" hidden>
       <section class="card mode-card">
         <div class="section-title"><h2>服务器模式</h2><span class="status-chip" id="server-mode">私有</span></div>
@@ -119,6 +120,25 @@
             <button class="primary">保存密码</button>
           </form>
           <p id="password-message" class="message" role="status" hidden></p>
+        </section>
+        <section class="card" id="entry-card">
+          <h2>管理入口</h2>
+          <form id="admin-entry">
+            <label>公网管理路径<input id="admin-path" type="text" required maxlength="34" autocomplete="off" spellcheck="false"></label>
+            <div class="toggle-row"><span id="http-admin-label">允许公网 HTTP 管理</span><button id="http-admin" type="button"
+              role="switch" aria-checked="false" aria-labelledby="http-admin-label"></button></div>
+            <div id="http-admin-fields" class="fields" hidden>
+              <label>HTTP 域名或 IPv4<input id="http-admin-host" type="text" maxlength="253" autocomplete="off" spellcheck="false" placeholder="自动接受访问地址"></label>
+              <label>HTTP 管理端口<input id="http-admin-port" type="number" min="1" max="65535" required></label>
+            </div>
+            <p id="http-admin-hint" hidden>HTTP 登录流量未加密。可在云安全组限制访问来源。</p>
+            <button class="primary">保存管理入口</button>
+          </form>
+          <div class="admin-entry-links">
+            <a id="http-admin-url" hidden></a>
+            <a id="https-admin-url" hidden></a>
+            <p id="admin-entry-status" role="status" hidden></p>
+          </div>
         </section>
       </div>
       <div class="columns">

@@ -35,9 +35,11 @@ const messages = {
   server_update_unavailable: '当前安装方式未启用服务端自更新',
   server_update_busy: '正在处理上一项更新请求',
   server_update_version_changed: '可用版本已变化，请重新检查',
+  invalid_admin_path: '路径需以小写字母开头，可用小写字母、数字、下划线或连字符，最多 32 位。',
+  invalid_admin_host: '请输入 HTTP 管理入口所用的域名或 IPv4 地址。',
   setup_restricted: '首次设置仅可在新实例上配置 HTTPS 和切换公共模式',
   setup_pem_missing: '服务端数据目录缺少证书链或私钥文件，请按安装文档放置后重试',
-  setup_expired: '首次设置入口已到期，请通过回环管理地址继续',
+  setup_pem_required: '请直接将证书链与私钥放到服务器的数据目录。',
 };
 const number = id => Number($(id).value);
 const enabled = id => $(id).getAttribute('aria-checked') === 'true';
@@ -63,7 +65,7 @@ function showLogin() {
   closeDeviceName();
 }
 async function api(path, body) {
-  const response = await fetch('/admin/' + path, body === undefined ? { cache: 'no-store' } : {
+  const response = await fetch('./' + path, body === undefined ? { cache: 'no-store' } : {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), cache: 'no-store',
   });
   const result = await response.json();
@@ -277,25 +279,27 @@ function renderLists(state) {
 }
 let canConvert = false;
 const initialSetup = document.body.hasAttribute('data-initial-setup');
-if (initialSetup) {
-  $('login-label').textContent = '首次设置码';
-  $('login-hint').textContent = '输入安装程序显示的首次设置码。管理员密码在 HTTPS 或回环管理页使用。';
-  $('token').autocomplete = 'off';
-  $('domain-label').textContent = '同步域名';
-  $('domain').placeholder = 'sync.example.com';
+const httpAdmin = document.body.hasAttribute('data-http-admin');
+let httpEntryClosed = false;
+if (httpAdmin) {
+  if (initialSetup) $('login-label').textContent = '首次设置码或管理员密码';
+  $('login-hint').textContent = initialSetup
+    ? '首次配置可使用安装程序显示的设置码。HTTP 登录流量未加密。'
+    : 'HTTP 登录流量未加密。请在受信任的网络中访问。';
 }
 function renderSetup(state, resetSettings) {
   const shared = state.mode === 'public', active = state.activeEndpoint, candidate = state.candidate;
   $('preview').hidden = $('installation-card').hidden = $('security-card').hidden = $('accounts-card').hidden = true;
+  $('entry-card').hidden = true;
   $('update-settings').hidden = $('public-mode').hidden = $('pem-files').hidden = true;
   $('private-mode').hidden = shared || state.used;
   $('setup-pem-hint').hidden = $('setup-hint').hidden = false;
   $('server-mode').textContent = shared ? '公共' : '私有';
   $('network-scope').textContent = '首次设置';
-  $('setup-hint').textContent = shared ? '用安装程序显示的管理员密码登录 HTTPS 管理面板。登录成功后，此 HTTP 入口关闭。'
+  $('setup-hint').textContent = shared ? '可使用管理员密码登录 HTTPS 管理面板。首次设置码随后失效，HTTP 管理入口会保留。'
     : '配置公网域名和 HTTPS 端口后，可将此实例转为公共服务器。';
-  $('setup-https').hidden = !shared || !state.publicUrl;
-  if (!$('setup-https').hidden) $('setup-https').href = state.publicUrl + '/admin/';
+  $('setup-https').hidden = !state.adminEntry.httpsUrl;
+  if (!$('setup-https').hidden) $('setup-https').href = state.adminEntry.httpsUrl;
   $('network').hidden = shared || state.used;
   $('active-address').textContent = '同步端口 ' + active.port;
   $('migration').hidden = !candidate || shared;
@@ -308,7 +312,37 @@ function renderSetup(state, resetSettings) {
     fillNetwork(candidate || { ...active, port: 8888, tls: true });
     $('tls').disabled = true;
   }
+  $('domain-label').textContent = '同步域名';
+  $('domain').placeholder = 'sync.example.com';
   showCertificate(active, candidate);
+}
+function showHttpEntryFields() {
+  const open = enabled('http-admin');
+  $('http-admin-fields').hidden = $('http-admin-hint').hidden = !open;
+}
+function setEntryLink(id, target) {
+  const link = $(id);
+  link.hidden = !target;
+  if (target) {
+    link.href = target;
+    link.textContent = target;
+  }
+}
+function renderAdminEntry(entry, resetSettings) {
+  $('entry-card').hidden = false;
+  if (resetSettings) {
+    $('admin-path').value = entry.path;
+    $('http-admin-host').value = entry.host;
+    $('http-admin-port').value = entry.port;
+    toggle('http-admin', entry.enabled);
+    showHttpEntryFields();
+  }
+  setEntryLink('http-admin-url', entry.httpUrl);
+  setEntryLink('https-admin-url', entry.httpsUrl);
+  const statusText = entry.error ? 'HTTP 管理入口未启动。' + (messages[entry.error] ?? '')
+    : entry.listening && !entry.httpUrl ? 'HTTP 管理入口正在监听端口 ' + entry.port : '';
+  $('admin-entry-status').hidden = !statusText;
+  $('admin-entry-status').textContent = statusText;
 }
 function render(state, resetSettings = false) {
   loggedIn = true;
@@ -318,7 +352,14 @@ function render(state, resetSettings = false) {
   const waitingForUpdate = !shared && !supportsManagement && bound;
   $('dashboard').hidden = false;
   if (state.initialSetup) { renderSetup(state, resetSettings); return; }
-  $('preview').hidden = shared;
+  $('preview').hidden = shared || httpAdmin;
+  $('setup-hint').hidden = $('setup-https').hidden = true;
+  $('security-card').hidden = $('accounts-card').hidden = $('update-settings').hidden = $('network').hidden = false;
+  $('pem-files').hidden = httpAdmin;
+  $('setup-pem-hint').hidden = !httpAdmin;
+  $('domain-label').textContent = '域名或 IP';
+  $('domain').placeholder = 'localhost';
+  renderAdminEntry(state.adminEntry, resetSettings);
   $('private-mode').hidden = $('installation-card').hidden = shared;
   $('public-mode').hidden = !shared;
   $('server-mode').textContent = shared ? '公共' : '私有';
@@ -385,7 +426,7 @@ function render(state, resetSettings = false) {
   if (snap !== listSnapshot) { listSnapshot = snap; renderLists(state); }
 }
 async function refresh(resetSettings = false) {
-  if (requestRunning) return;
+  if (requestRunning || httpEntryClosed) return;
   requestRunning = true;
   try { render(await api('status'), resetSettings); }
   catch (error) { if (loggedIn) notice(error.message, true); }
@@ -421,6 +462,32 @@ setSubmit($('change-password'), async () => {
     message.dataset.error = 'true';
     message.hidden = false;
   }
+});
+$('http-admin').addEventListener('click', () => {
+  toggle('http-admin', !enabled('http-admin'));
+  showHttpEntryFields();
+});
+setSubmit($('admin-entry'), async () => {
+  const state = await api('entry', { path: $('admin-path').value, enabled: enabled('http-admin'),
+    host: $('http-admin-host').value, port: number('http-admin-port') });
+  const entry = state.adminEntry;
+  if (httpAdmin && !entry.httpUrl) {
+    httpEntryClosed = true;
+    $('dashboard').hidden = true;
+    if (entry.httpsUrl) {
+      $('entry-recovery').href = entry.httpsUrl;
+      $('entry-recovery').hidden = false;
+    }
+    notice(entry.httpsUrl ? 'HTTP 管理入口已关闭。' : 'HTTP 管理入口已关闭，可从服务器本机的回环管理页重新启用。');
+    return;
+  }
+  const destination = httpAdmin ? entry.httpUrl : location.protocol === 'https:' ? location.origin + entry.path + '/' : '';
+  if (destination && destination !== location.origin + location.pathname) {
+    location.replace(destination);
+    return;
+  }
+  render(state, true);
+  notice('管理入口已保存');
 });
 setSubmit($('network'), async () => {
   const tls = enabled('tls');

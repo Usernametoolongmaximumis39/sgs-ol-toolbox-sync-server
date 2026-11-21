@@ -620,7 +620,7 @@ async function testCertificate(dir, domain = 'localhost') {
   return null;
 }
 
-test('temporary HTTP setup accepts only its setup code and closes after HTTPS admin login', async t => {
+test('the HTTP admin URL survives first setup and HTTPS login', async t => {
   const setupPort = await freePort();
   let code, password;
   const env = await fixture(t, { setupHost: '127.0.0.1', setupPort, publicNetwork: true, privateNetwork: true, httpsAdmin: true,
@@ -629,11 +629,11 @@ test('temporary HTTP setup accepts only its setup code and closes after HTTPS ad
   assert.match(await (await fetch(setup + '/admin/')).text(), /data-initial-setup/);
   assert.equal((await fetch(setup + '/health')).status, 404);
   assert.equal((await post(setup, '/admin/login', { token: code }, { Origin: site })).status, 403);
-  assert.equal((await post(setup, '/admin/login', { token: password }, { Origin: setup })).status, 401);
+  assert.equal((await post(setup, '/admin/login', { token: password }, { Origin: setup })).status, 200);
   const setupLogin = await post(setup, '/admin/login', { token: code }, { Origin: setup });
   assert.equal(setupLogin.status, 200);
   const Cookie = setupLogin.headers.get('set-cookie').split(';')[0];
-  assert.match(Cookie, /^sgs_sync_setup=/);
+  assert.match(Cookie, /^sgs_sync_http_admin=/);
   assert.equal((await fetch(env.server.adminUrl + '/admin/status', { headers: { Cookie } })).status, 401);
   const status = await (await fetch(setup + '/admin/status', { headers: { Cookie } })).json();
   assert.equal(status.initialSetup, true);
@@ -662,16 +662,66 @@ test('temporary HTTP setup accepts only its setup code and closes after HTTPS ad
   assert.equal(await secure(code), 401);
   assert.equal(await secure(password), 200);
   await assert.rejects(readFile(join(env.dir, 'initial-setup.json')), { code: 'ENOENT' });
-  await assert.rejects(fetch(setup + '/admin/'));
+  const panel = await (await fetch(setup + '/admin/')).text();
+  assert.match(panel, /data-http-admin/);
+  assert.doesNotMatch(panel, /data-initial-setup/);
+  assert.equal((await setupPost('status', {})).status, 401);
+  assert.equal((await post(setup, '/admin/login', { token: code }, { Origin: setup })).status, 401);
+  assert.equal((await post(setup, '/admin/login', { token: password }, { Origin: setup })).status, 200);
 });
 
-test('an expired first-setup code cannot authenticate over HTTP', async t => {
+test('the default HTTP admin listener needs no preselected hostname and survives setup-code expiry', async t => {
   const setupPort = await freePort();
-  let code;
-  const env = await fixture(t, { setupHost: '127.0.0.1', setupPort, async seed(dir) { code = await createSetupCode(dir); } });
+  let code, password;
+  const env = await fixture(t, { httpAdminEnabled: true, setupPort,
+    async seed(dir) { code = await createSetupCode(dir); password = await resetAdminPassword(dir); } });
   const setup = `http://127.0.0.1:${setupPort}`;
+  assert.equal((await fetch(setup + '/admin/')).status, 200);
+  assert.equal((await fetch(setup + '/health')).status, 404);
   env.advance(61 * 60_000);
-  assert.equal((await post(setup, '/admin/login', { token: code }, { Origin: setup })).status, 410);
+  assert.equal((await post(setup, '/admin/login', { token: code }, { Origin: setup })).status, 401);
+  assert.equal((await post(setup, '/admin/login', { token: password }, { Origin: setup })).status, 200);
+});
+
+test('a signed-in administrator can rename and close the persistent HTTP entry', async t => {
+  const env = await fixture(t), setupPort = await freePort();
+  const operator = await admin(env.server);
+  const config = { path: 'admin', enabled: true, host: '127.0.0.1', port: setupPort };
+  const base = `http://127.0.0.1:${setupPort}`;
+  assert.equal((await operator.send('entry', { ...config, path: '/v1' })).status, 400);
+  assert.equal((await operator.send('entry', { ...config, port: Number(new URL(env.server.syncUrl).port) })).status, 409);
+  assert.equal((await operator.send('entry', config)).status, 200);
+  assert.equal((await fetch(base + '/health')).status, 404);
+  const password = (await readFile(env.server.adminFile, 'utf8')).trim();
+  const login = async path => {
+    const response = await post(base, path + '/login', { token: password }, { Origin: base });
+    assert.equal(response.status, 200);
+    return response.headers.get('set-cookie');
+  };
+  const Cookie = (await login('/admin')).split(';')[0];
+  const input = { ...config, path: '/sync-panel/' };
+  assert.equal((await post(base, '/admin/entry', input, { Origin: site, Cookie })).status, 403);
+  const renamed = await post(base, '/admin/entry', input, { Origin: base, Cookie });
+  assert.equal(renamed.status, 200);
+  assert.equal((await renamed.json()).adminEntry.httpUrl, base + '/sync-panel/');
+  assert.equal((await fetch(base + '/admin/')).status, 404);
+  assert.equal((await fetch(base + '/sync-panel', { redirect: 'manual' })).headers.get('location'), '/sync-panel/');
+  assert.match(await (await fetch(base + '/sync-panel/')).text(), /\.\/app.js/);
+  assert.equal((await fetch(base + '/sync-panel/app.js')).status, 200);
+  assert.equal((await fetch(env.server.adminUrl + '/admin/')).status, 200);
+  await env.server.close();
+  await env.start();
+  assert.equal((await fetch(base + '/admin/')).status, 404);
+  const nextCookie = await login('/sync-panel');
+  assert.match(nextCookie, /Path=\/sync-panel\//);
+  const disabled = await post(base, '/sync-panel/entry', { ...input, enabled: false }, { Origin: base, Cookie: nextCookie.split(';')[0] });
+  assert.equal(disabled.status, 200);
+  assert.equal((await disabled.json()).adminEntry.httpUrl, null);
+  await assert.rejects(fetch(base + '/sync-panel/'));
+  await env.server.close();
+  await env.start();
+  await assert.rejects(fetch(base + '/sync-panel/'));
+  assert.equal((await fetch(env.server.adminUrl + '/admin/')).status, 200);
 });
 
 test('loopback TLS validates certificate names and restricts plaintext redirects', async t => {
@@ -791,5 +841,14 @@ test('HTTPS admin requires a password and limits sessions to the authenticated o
   assert.equal((await secure('/admin/login', { token: password })).status, 429);
   assert.equal((await operator.get('/admin/status')).status, 200);
   env.advance(60_000);
-  assert.equal((await secure('/admin/login', { token: password })).status, 200);
+  const relogin = await secure('/admin/login', { token: password });
+  assert.equal(relogin.status, 200);
+  const session = relogin.headers['set-cookie'][0].split(';')[0];
+  const change = await secure('/admin/entry', { path: 'maintenance', enabled: false, host: '', port: 17431 }, { Cookie: session });
+  assert.equal(change.status, 200);
+  assert.equal(JSON.parse(change.text).adminEntry.httpsUrl, origin + '/maintenance/');
+  assert.equal((await secure('/admin/')).status, 404);
+  assert.equal((await secure('/maintenance/')).status, 200);
+  assert.equal((await secure('/maintenance/status', null, { Cookie: session })).status, 200);
+  assert.equal((await operator.get('/admin/status')).status, 200);
 });

@@ -47,6 +47,8 @@ button.primary { background: #4a3c25; color: #f9e4b5; border-color: #806645; }
 .issued, .migration { padding: 12px; border-left: 2px solid #8c724a; background: #24231f; border-radius: 0 7px 7px 0; }
 .mode-card { margin-bottom: 16px; }
 #security-card form { max-width: 28rem; }
+.admin-entry-links { display: grid; gap: 8px; }
+.admin-entry-links a { overflow-wrap: anywhere; }
 .mode-card details { margin-top: 8px; }
 .mode-card summary { cursor: pointer; color: var(--accent); }
 .mode-card details[open] > summary { margin-bottom: 10px; }

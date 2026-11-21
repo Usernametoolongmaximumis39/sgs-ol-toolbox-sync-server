@@ -34,9 +34,7 @@ for port in "$sync_port" "$admin_port" "$setup_port"; do
     printf '%s\n' "$port" | grep -Eq '^[1-9][0-9]{0,4}$' && [ "$port" -le 65535 ] || fail 'Invalid TCP port.'
 done
 [ "$sync_port" != "$admin_port" ] || fail 'Sync and admin ports must differ.'
-if [ -n "$setup_host" ]; then
-    [ "$sync_port" != "$setup_port" ] && [ "$admin_port" != "$setup_port" ] || fail 'The setup port must use a separate port.'
-fi
+[ "$sync_port" != "$setup_port" ] && [ "$admin_port" != "$setup_port" ] || fail 'The HTTP management port must use a separate port.'
 [ -d /run/systemd/system ] || fail 'This installer requires systemd as the host service manager.'
 case "$(uname -m)" in
     x86_64) arch=x64 ;;
@@ -64,11 +62,9 @@ await_admin() {
     fail "Admin panel failed its startup check. Inspect: journalctl -u $service -n 50"
 }
 show_access() {
-    printf '\nLocal admin login: http://127.0.0.1:%s/admin/\n' "$admin_port"
-    printf 'Admin TCP port: %s (loopback only)\n' "$admin_port"
+    printf '\nLocal recovery URL (on the server): http://127.0.0.1:%s/admin/\n' "$admin_port"
     printf 'Initial sync TCP port: %s (loopback only)\n' "$sync_port"
     printf 'Public sync and HTTPS admin: configure a domain, certificate and separate TCP port in the panel (e.g. 8888).\n'
-    printf 'From your own computer: ssh -N -L %s:127.0.0.1:%s USER@SERVER\n' "$admin_port" "$admin_port"
     printf 'Password reset: sudo %s/reset-admin-password\n' "$root"
 }
 
@@ -98,15 +94,13 @@ import socket
 import sys
 
 host = sys.argv[1]
-addresses = ["127.0.0.1", "127.0.0.1"]
 if host:
     try:
         ipaddress.IPv4Address(host)
     except ValueError:
         if len(host) > 253 or not re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", host) or re.fullmatch(r"[0-9.]+", host):
             sys.exit("Invalid --host. Provide a public IPv4 address or DNS name, without a scheme or port.")
-    addresses.append("0.0.0.0")
-for address, port in zip(addresses, map(int, sys.argv[2:])):
+for address, port in zip(("127.0.0.1", "127.0.0.1", "0.0.0.0"), map(int, sys.argv[2:])):
     with socket.socket() as sock:
         try:
             sock.bind((address, port))
@@ -212,11 +206,11 @@ ln -s "$root/releases/v$version" "$root/current"
 install -m 755 "$root/current/distribution/reset-linux.sh" "$root/reset-admin-password"
 password=$(runuser -u "$service" -- "$root/runtime/node" "$root/current/tools/appearance-sync.mjs" --data-dir "$data" --reset-admin-password)
 printf '%s\n' "$password" | grep -Eq '^A1[A-Za-z0-9_-]{43}$' || fail 'Initial administrator password creation failed.'
-setup_args=
+setup_code=$(runuser -u "$service" -- "$root/runtime/node" "$root/current/tools/appearance-sync.mjs" --data-dir "$data" --create-setup-code)
+printf '%s\n' "$setup_code" | grep -Eq '^[A-Za-z0-9_-]{43}$' || fail 'Initial setup code creation failed.'
+setup_args="--http-admin --setup-port $setup_port"
 if [ -n "$setup_host" ]; then
-    setup_code=$(runuser -u "$service" -- "$root/runtime/node" "$root/current/tools/appearance-sync.mjs" --data-dir "$data" --create-setup-code)
-    printf '%s\n' "$setup_code" | grep -Eq '^[A-Za-z0-9_-]{43}$' || fail 'Initial setup code creation failed.'
-    setup_args=" --setup-host $setup_host --setup-port $setup_port"
+    setup_args="$setup_args --setup-host $setup_host"
 fi
 
 cat > "$unit" <<EOF
@@ -229,7 +223,7 @@ User=$service
 Group=$service
 WorkingDirectory=$root/current
 Environment=HOME=$data
-ExecStart=$root/runtime/node $root/current/tools/appearance-sync.mjs --data-dir $data --port $sync_port --admin-port $admin_port$setup_args --private-network --public-network --https-admin --server-update-dir $control
+ExecStart=$root/runtime/node $root/current/tools/appearance-sync.mjs --data-dir $data --port $sync_port --admin-port $admin_port $setup_args --private-network --public-network --https-admin --server-update-dir $control
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=yes
@@ -246,18 +240,20 @@ systemctl daemon-reload
 (umask 022; sh "$root/current/distribution/install-updater.sh" "$root" "$data" "$service" "$admin_port")
 systemctl enable --now "$service"
 await_admin
-if [ -n "$setup_host" ]; then
-    setup_authority="$setup_host"
-    [ "$setup_port" = 80 ] || setup_authority="$setup_host:$setup_port"
-    setup_page=$(curl -fsS --noproxy '*' --max-time 5 -H "Host: $setup_authority" "http://127.0.0.1:$setup_port/admin/")
-    printf '%s\n' "$setup_page" | grep -q 'data-initial-setup' || fail 'The initial setup page failed its startup check.'
-fi
+setup_authority=${setup_host:-127.0.0.1}
+[ "$setup_port" = 80 ] || setup_authority="$setup_authority:$setup_port"
+setup_page=$(curl -fsS --noproxy '*' --max-time 5 -H "Host: $setup_authority" "http://127.0.0.1:$setup_port/admin/")
+printf '%s\n' "$setup_page" | grep -q 'data-initial-setup' || fail 'The HTTP management page failed its startup check.'
 printf '%s %s\n' "$sync_port" "$admin_port" > "$root/installed"
-printf '\nInstalled server v%s (private mode)\n' "$version"
-if [ -n "$setup_host" ]; then
-    printf 'First setup link (HTTP, 60 minutes): http://%s:%s/admin/\n' "$setup_host" "$setup_port"
-    printf 'Setup TCP port: %s (allow your public client IP in the cloud firewall)\n' "$setup_port"
-    printf 'First setup code: %s\n' "$setup_code"
+shown_host="$setup_host"
+if [ -z "$shown_host" ]; then
+    detected_ip=$(curl -4fs --max-time 5 https://api.ipify.org || true)
+    shown_host=$(python3 -c 'import ipaddress, sys; print(ipaddress.IPv4Address(sys.argv[1].strip()))' "$detected_ip" 2>/dev/null || true)
 fi
+printf '\nInstalled server v%s (private mode)\n' "$version"
+printf 'HTTP admin link: http://%s:%s/admin/\n' "${shown_host:-SERVER_PUBLIC_IP_OR_DNS}" "$setup_port"
+printf 'HTTP admin TCP port: %s (allow your public client IP in the cloud firewall)\n' "$setup_port"
+printf 'First setup code: %s\n' "$setup_code"
+printf 'The setup code lasts 60 minutes. The HTTP admin link stays active.\n'
 show_access
 printf 'Initial admin password: %s\n' "$password"
