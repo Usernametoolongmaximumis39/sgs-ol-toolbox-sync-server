@@ -1,6 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { equal, hash, isToken, requireValue, SyncError } from './state.mjs';
 import { PREFERENCE_GROUPS, PREFERENCES_LIMIT } from '../../src/shared/sync-preferences.js';
+import { publicUserCode, publicUserName } from '../../src/shared/public-sync-account.js';
 import { openSyncChanges } from './sync-changes.mjs';
 
 export const VAULT_BYTES = 64 * 1024 * 1024;
@@ -43,14 +44,34 @@ export function openPublicVaults(store, now, changes = openSyncChanges(store)) {
     );
     CREATE TABLE IF NOT EXISTS view_attempts (ip TEXT PRIMARY KEY, count INTEGER NOT NULL, until INTEGER NOT NULL);
   `);
+  transaction(() => {
+    const columns = new Set(db.prepare('PRAGMA table_info(vaults)').all().map(column => column.name));
+    if (!columns.has('user_code')) db.exec('ALTER TABLE vaults ADD COLUMN user_code TEXT');
+    if (!columns.has('user_name')) db.exec('ALTER TABLE vaults ADD COLUMN user_name TEXT');
+    db.exec('CREATE INDEX IF NOT EXISTS vaults_active_user ON vaults (user_code) WHERE revoked = 0 AND user_code IS NOT NULL');
+  });
   const lookup = db.prepare('SELECT * FROM vaults WHERE id = ? AND revoked = 0');
-  const activeCount = () => db.prepare('SELECT count(*) AS count FROM vaults WHERE revoked = 0').get().count;
+  const byUserCode = db.prepare('SELECT id FROM vaults WHERE user_code = ? AND revoked = 0 LIMIT 1');
+  const countAccounts = db.prepare('SELECT count(DISTINCT COALESCE(user_code, id)) AS count FROM vaults WHERE revoked = 0');
+  const activeCount = () => countAccounts.get().count;
   const accountLimit = () => store.get('publicAccountLimit') ?? 10;
   const authenticate = ({ vault, credential }) => {
     const row = isToken(vault) && isToken(credential) && lookup.get(vault);
     requireValue(row && equal(row.credential, hash(credential)), 'binding_required', 401);
     return row;
   };
+  function accountProfile(profile) {
+    if (profile === undefined) return null;
+    const userCode = publicUserCode(profile?.userCode);
+    requireValue(userCode && typeof profile.name === 'string' && profile.name.length <= 100, 'invalid_public_profile');
+    return { userCode, name: publicUserName(profile.name) };
+  }
+  const writeProfile = db.prepare("UPDATE vaults SET user_code = ?, user_name = COALESCE(NULLIF(?, ''), user_name) WHERE id = ?");
+  function noteProfile(current, profile) {
+    if (!profile) return;
+    requireValue(!current.user_code || current.user_code === profile.userCode, 'account_mismatch', 403);
+    writeProfile.run(profile.userCode, profile.name, current.id);
+  }
   const read = db.prepare('SELECT kind, record_id AS id, ciphertext FROM vault_records WHERE vault = ? ORDER BY rowid');
   const readRecord = db.prepare('SELECT ciphertext FROM vault_records WHERE vault = ? AND kind = ? AND record_id = ?');
   const viewRead = db.prepare("SELECT kind, record_id AS id, ciphertext FROM vault_records WHERE vault = ? AND kind IN ('event', 'match') ORDER BY rowid");
@@ -67,15 +88,21 @@ export function openPublicVaults(store, now, changes = openSyncChanges(store)) {
   function register(body, enforceLimit) {
     const { vault, credential, verifier } = body;
     requireValue([vault, credential, verifier].every(isToken), 'invalid_binding');
+    const profile = accountProfile(body.profile);
     const current = lookup.get(vault);
     if (current) {
       authenticate(body);
       requireValue(equal(current.verifier, hash(verifier)), 'invalid_binding');
+      noteProfile(current, profile);
       return;
     }
     requireValue(!db.prepare('SELECT id FROM vaults WHERE id = ?').get(vault), 'binding_required', 401);
-    if (enforceLimit) requireValue(activeCount() < accountLimit(), 'account_limit', 409);
-    db.prepare('INSERT INTO vaults (id, credential, verifier) VALUES (?, ?, ?)').run(vault, hash(credential), hash(verifier));
+    if (enforceLimit) {
+      requireValue(!profile || !byUserCode.get(profile.userCode), 'public_recovery_required', 409);
+      requireValue(activeCount() < accountLimit(), 'account_limit', 409);
+    }
+    db.prepare('INSERT INTO vaults (id, credential, verifier, user_code, user_name) VALUES (?, ?, ?, ?, ?)')
+      .run(vault, hash(credential), hash(verifier), profile?.userCode ?? null, profile?.name || null);
   }
 
   return {
@@ -93,17 +120,21 @@ export function openPublicVaults(store, now, changes = openSyncChanges(store)) {
         requireValue(Array.isArray(keys) && keys.every(key => Array.isArray(key) && key.length === 2), 'invalid_record_id');
         validateRecords(keys.map(([kind, id]) => [kind, id, 'A'.repeat(38)]));
       }
+      requireValue(body.profile === undefined || revision === -1 && keys?.length === 0 && records.length === 0, 'invalid_public_profile');
       return transaction(() => {
         const current = authenticate(body);
+        const profile = accountProfile(body.profile);
+        noteProfile(current, profile);
+        const registration = profile ? { profileRegistered: true } : {};
         if (current.revision !== revision) {
           const selected = keys === undefined ? readRecords(read, vault) : keys.flatMap(([kind, id]) => {
             const row = readRecord.get(vault, kind, id);
             return row ? [[kind, id, row.ciphertext]] : [];
           });
-          return { revision: current.revision, records: selected };
+          return { revision: current.revision, records: selected, ...registration };
         }
         if (records.length) saveRecords(vault, records);
-        return { revision: current.revision + Number(records.length > 0), records: null };
+        return { revision: current.revision + Number(records.length > 0), records: null, ...registration };
       });
     },
     snapshot: vault => ({ snapshot: readRecords(read, vault), cursor: changes.cursor('public:' + vault) }),
@@ -160,9 +191,11 @@ export function openPublicVaults(store, now, changes = openSyncChanges(store)) {
     },
     authenticate,
     list: () => [
-      ...db.prepare('SELECT id, bytes, revoked FROM vaults WHERE revoked = 0 ORDER BY rowid DESC').all(),
+      ...db.prepare('SELECT id, bytes, revoked, user_code AS userCode, user_name AS name FROM vaults WHERE revoked = 0 ORDER BY rowid DESC').all(),
       ...db.prepare('SELECT id, bytes, revoked FROM vaults WHERE revoked = 1 ORDER BY rowid DESC LIMIT 100').all(),
     ],
-    revoke(id) { requireValue(db.prepare('UPDATE vaults SET revoked = 1 WHERE id = ?').run(id).changes, 'not_found', 404); },
+    revoke(id) {
+      requireValue(db.prepare('UPDATE vaults SET revoked = 1, user_code = NULL, user_name = NULL WHERE id = ?').run(id).changes, 'not_found', 404);
+    },
   };
 }

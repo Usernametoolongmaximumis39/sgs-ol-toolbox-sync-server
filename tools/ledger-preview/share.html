@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>分享的账本与战绩</title>
+  <link rel="stylesheet" href="./preview.css">
+  <script src="./share.js" type="module"></script>
+</head>
+<body>
+  <main class="share-page">
+    <header class="page-header">
+      <div>
+        <h1>分享的账本与战绩</h1>
+        <p class="muted" id="unlock-hint">使用分享人提供的六位查看码。</p>
+      </div>
+    </header>
+    <p id="error" role="alert" hidden></p>
+    <form id="unlock" class="share-form" hidden>
+      <label id="share-code-field">分享链接或凭据
+        <input id="share-code" maxlength="2048" autocomplete="off" spellcheck="false" autocapitalize="off">
+      </label>
+      <label>六位查看码
+        <input id="view-pass" type="password" minlength="6" maxlength="6" required autocomplete="off" spellcheck="false">
+      </label>
+      <button type="submit">解密并查看</button>
+    </form>
+    <section id="shared-history" aria-label="分享记录" hidden>
+      <div class="history-header">
+        <div class="segments" role="group" aria-label="记录类型">
+          <button type="button" data-stream="events" aria-pressed="true">账本流水</button>
+          <button type="button" data-stream="matches" aria-pressed="false">对局战绩</button>
+        </div>
+        <p class="muted" id="summary" role="status"></p>
+      </div>
+      <ul id="rows"></ul>
+      <nav aria-label="记录分页" id="pages" hidden>
+        <button type="button" id="prev">上一页</button>
+        <span class="muted" id="page"></span>
+        <button type="button" id="next">下一页</button>
+      </nav>
+    </section>
+  </main>
+</body>
+</html>

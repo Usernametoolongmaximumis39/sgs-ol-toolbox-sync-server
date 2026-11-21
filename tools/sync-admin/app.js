@@ -214,6 +214,36 @@ function renderDevices(state, accounts, supportsManagement) {
   $('devices').replaceChildren(...rows);
   $('device-management').hidden = !rows.length;
 }
+function renderPublicAccounts(vaults) {
+  const accounts = new Map();
+  for (const vault of vaults) {
+    const key = vault.userCode || vault.id;
+    if (!accounts.has(key)) accounts.set(key, []);
+    accounts.get(key).push(vault);
+  }
+  const revokeVault = (vault, multiple) => button(multiple ? '移除此绑定' : '移除账号', async () => {
+    const message = multiple ? '移除此绑定会使对应的同步和分享凭据失效。继续？'
+      : '移除后会释放一个账号名额，该账号的同步和分享凭据均会失效。继续？';
+    if (!window.confirm(message)) return;
+    render(await api('public/revoke', { id: vault.id }));
+  }, 'danger');
+  for (const bindings of accounts.values()) {
+    const { userCode } = bindings[0];
+    const name = bindings.find(vault => vault.name)?.name;
+    const multiple = bindings.length > 1;
+    const group = document.createElement('div');
+    group.className = 'public-account';
+    group.append(paragraph(userCode ? [name || '昵称未登记', userCode].join(' · ')
+      : bindings[0].revoked ? '已解除的绑定' : '账号资料待补登'));
+    for (const vault of bindings) {
+      const size = Math.ceil(vault.bytes / 1024) + ' KB 密文';
+      group.append(entry([short(vault.id), vault.revoked ? '已解除' : size].join(' · '),
+        ...(vault.revoked ? [] : [revokeVault(vault, multiple)])));
+    }
+    $('accounts').append(group);
+  }
+  if (!vaults.length) $('accounts').append(paragraph('暂无公共绑定'));
+}
 function renderLists(state) {
   $('migration-accounts').replaceChildren(...state.migration.map(row => entry(
     `${row.label} · ${row.ready ? '加密副本已就绪' : '等待工具箱准备'}`,
@@ -226,13 +256,7 @@ function renderLists(state) {
   $('device-management').hidden = true;
   if (state.mode === 'public') {
     closeDeviceName();
-    for (const vault of state.vaults) $('accounts').append(entry(
-      `${short(vault.id)} · ${vault.revoked ? '已解除' : Math.ceil(vault.bytes / 1024) + ' KB 密文'}`,
-      ...(vault.revoked ? [] : [button('移除账号', async () => {
-        if (!window.confirm('移除后会释放一个绑定名额，该账号的同步和分享凭据均会失效。继续？')) return;
-        render(await api('public/revoke', { id: vault.id }));
-      }, 'danger')])));
-    if (!state.vaults.length) $('accounts').append(paragraph('暂无公共绑定'));
+    renderPublicAccounts(state.vaults);
     return;
   }
   const supportsManagement = hasPrivateManagement(state);

@@ -10,6 +10,9 @@ import { base64url, readPairingRequest, sealPairing, syncProofBytes } from '../.
 import { sealPrivateCredential } from '../../src/core/private-sync-code.js';
 import { describeSyncDevice } from './device-info.mjs';
 import { vaultRecords } from '../../src/core/sync-vault-records.js';
+import { syncAccountSeed } from '../../src/core/dev-appearance-sync.js';
+import { publicUserCode } from '../../src/shared/public-sync-account.js';
+import { publicSharePath, publicViewPath } from '../../src/shared/public-sync-view.js';
 import { EXISTING_SYNC_FILE, openAppearanceSyncData, readJson, send, syncOrigins } from '../appearance-sync.mjs';
 import { equal, hash, isToken, openState, requireValue, SyncError, token } from './state.mjs';
 import { openPublicVaults, VAULT_BYTES } from './public-vault.mjs';
@@ -32,9 +35,16 @@ const host = '127.0.0.1';
 const grace = 60 * 60000;
 const settings = { requestTimeout: 10000, headersTimeout: 5000, keepAliveTimeout: 2000 };
 const assets = { '/admin/': ['index.html', 'text/html'], '/admin/app.js': ['app.js', 'text/javascript'], '/admin/style.css': ['style.css', 'text/css'] };
+const shareAssets = new Map([
+  [publicSharePath, ['../ledger-preview/share.html', 'text/html']],
+  [publicSharePath + 'preview.css', ['../ledger-preview/preview.css', 'text/css']],
+  [publicSharePath + 'share.js', ['../ledger-preview/share.js', 'text/javascript']],
+  ...['public-sync-view.js', 'base64url.js', 'match-sync-records.js'].map(file =>
+    [publicSharePath + file, ['../../src/shared/' + file, 'text/javascript']]),
+]);
 const pairingPaths = new Set(['/v1/proof', '/v1/bind', '/v1/recover', '/v1/confirm', '/v1/unbind',
   '/v1/private/request', '/v1/private/join', '/v1/private/release', '/v1/private/view', '/v1/private/bind-credential', PREFERENCES_SYNC_PATH, BACKUP_READ_PATH, SYNC_CHANGES_PATH]);
-const vaultPaths = new Set(['/v2/vault/register', '/v2/vault/exchange', '/v2/vault/backup', '/v2/vault/view', '/v2/migrate/read', '/v2/migrate/stage', PUBLIC_CHANGES_PATH]);
+const vaultPaths = new Set(['/v2/vault/register', '/v2/vault/exchange', '/v2/vault/backup', publicViewPath, '/v2/migrate/read', '/v2/migrate/stage', PUBLIC_CHANGES_PATH]);
 const nonceFormat = /^[A-Za-z0-9_-]{22}$/;
 const maxAdminBody = 128 * 1024;
 const setupNetworkPaths = ['/admin/status', '/admin/network', '/admin/cancel', '/admin/public/enable'];
@@ -248,6 +258,14 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
       if (request.method === 'GET' && request.url === '/health') {
         return send(response, 200, { ok: true, service: 'appearances-sync', mode: publicMode() ? 'public' : 'private' });
       }
+      if (current.tls && publicMode() && request.method === 'GET' && shareAssets.has(request.url)) {
+        const [file, type] = shareAssets.get(request.url);
+        const asset = await readFile(new URL(file, import.meta.url), 'utf8');
+        const disabled = request.url === publicSharePath && !canPreview();
+        response.setHeader('Content-Security-Policy', "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'");
+        response.writeHead(disabled ? 403 : 200, { 'Content-Type': type + '; charset=utf-8', 'X-Robots-Tag': 'noindex, nofollow' });
+        return response.end(disabled ? asset.replace('<body>', '<body data-preview-disabled>') : asset);
+      }
       if (!pairingPaths.has(request.url) && !vaultPaths.has(request.url) && request.url !== STARGAZING_SYNC_PATH) {
         requireValue(!publicMode(), 'public_mode_required', 404);
         const url = new URL(request.url, origins[0]);
@@ -271,7 +289,9 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
           allowLegacyAccount: compatibility ? key => data.hasAccount(key) && !store.isManagedStore(key) : undefined,
           canWrite: key => publicMode() ? 'public_mode_required' : vaults.hasStage(key) ? 'migration_staged' : true });
       }
-      requireValue(allowedOrigins.has(origin), 'origin_not_allowed', 403);
+      const sameOriginView = request.url === publicViewPath && request.method === 'POST'
+        && current.tls && authorities.includes(origin) && new URL(origin).host === request.headers.host;
+      requireValue(allowedOrigins.has(origin) || sameOriginView, 'origin_not_allowed', 403);
       response.setHeader('Vary', 'Origin');
       response.setHeader('Access-Control-Allow-Origin', origin);
       if (request.method === 'OPTIONS') {
@@ -298,6 +318,10 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
             const row = snapshot(device.storeKey);
             if (request.url.endsWith('/read')) return send(response, 200, row);
             requireValue(row.fingerprint === body.fingerprint, 'migration_records_changed', 409);
+            if (body.profile !== undefined) {
+              const code = publicUserCode(body.profile?.userCode);
+              requireValue(code && equal(device.gameKey, hash(syncAccountSeed(String(Number(code))))), 'account_mismatch', 403);
+            }
             const keys = vaultRecords(row.snapshot).map(([kind, id]) => kind + ':' + id);
             vaults.stage(device.storeKey, row.fingerprint, keys, body);
             return send(response, 200, { ok: true });

@@ -71,6 +71,8 @@ button.primary { background: #4a3c25; color: #f9e4b5; border-color: #806645; }
 .account-name { min-width: 0; }
 .entry-actions { display: flex; gap: 5px; flex-wrap: wrap; }
 .entry-row button { font-size: 12px; padding: 4px 7px; }
+.public-account > p { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+.public-account .entry-row p { color: var(--muted); font-size: 12px; }
 #device-management summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 #device-management[open] > summary, #device-management > .entries, #name-device { margin-bottom: 8px; }
 .device-identity { flex: 1 1 18ch; min-width: 0; }

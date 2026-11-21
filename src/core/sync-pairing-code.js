@@ -1,4 +1,6 @@
 import { Aes128Gcm, CipherSuite, DhkemP256HkdfSha256, HkdfSha256 } from '@hpke/core';
+import { base64url, fromBase64url } from '../shared/base64url.js';
+export { base64url, fromBase64url };
 
 const suite = new CipherSuite({ kem: new DhkemP256HkdfSha256(), kdf: new HkdfSha256(), aead: new Aes128Gcm() });
 const utf8 = new TextEncoder();
@@ -8,19 +10,6 @@ export const PAIR_INVITE = 'SGSI2';
 export const PAIR_UPDATE = 'SGSU2';
 export const PIN_FORMAT = /^[0-9]{4}$/;
 const domainFormat = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
-
-export function base64url(bytes) {
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
-}
-
-export function fromBase64url(value, length) {
-  if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) throw new Error('invalid_code');
-  const bytes = Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/')), char => char.charCodeAt(0));
-  if (base64url(bytes) !== value || length !== undefined && bytes.length !== length) throw new Error('invalid_code');
-  return bytes;
-}
 
 function joinBytes(...parts) {
   const bytes = new Uint8Array(parts.reduce((size, part) => size + part.length, 0));

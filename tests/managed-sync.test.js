@@ -14,10 +14,11 @@ import { startAppearanceSync } from '../tools/appearance-sync.mjs';
 import { startManagedSync } from '../tools/sync-admin/server.mjs';
 import { createSetupCode } from '../tools/sync-admin/initial-setup.mjs';
 import { resetAdminPassword } from '../tools/sync-admin/admin-password.mjs';
-import { openState } from '../tools/sync-admin/state.mjs';
+import { hash as hashToken, openState } from '../tools/sync-admin/state.mjs';
 import { openPublicVaults } from '../tools/sync-admin/public-vault.mjs';
 import { openSyncChanges } from '../tools/sync-admin/sync-changes.mjs';
 import { createPublicTransport, createVaultCipher, randomPass } from '../src/core/public-sync.js';
+import { publicSharePath, publicViewPath, publicViewLink, readPublicView } from '../src/shared/public-sync-view.js';
 import { openPrivateCredential } from '../src/core/private-sync-code.js';
 import { privateHttpRequest, privateSyncOrigin } from '../src/shared/private-sync-http.js';
 import { BACKUP_READ_PATH, SYNC_CHANGES_PATH } from '../src/shared/sync-paths.js';
@@ -575,6 +576,38 @@ test('public account limits survive restart and apply only to new bindings', asy
   } finally { state.close(); }
 });
 
+test('authenticated public profile backfills group legacy vaults and reject a new vault for the same user code', async t => {
+  const env = await fixture(t);
+  const state = openState(join(env.dir, 'sync.sqlite3'), 0, Date.now);
+  const legacy = () => ({ vault: token(), credential: token(), verifier: token() });
+  const first = legacy(), second = legacy();
+  const profile = { userCode: '41', name: '演练账号甲' };
+  const identify = (entry, profile) => ({ ...entry, revision: -1, records: [], keys: [], profile });
+  try {
+    // Recreate the public table as it existed before account profiles were stored.
+    state.db.exec('DROP INDEX vaults_active_user; ALTER TABLE vaults DROP COLUMN user_code; ALTER TABLE vaults DROP COLUMN user_name;');
+    const insert = state.db.prepare('INSERT INTO vaults (id, credential, verifier) VALUES (?, ?, ?)');
+    for (const { vault, credential, verifier } of [first, second]) insert.run(vault, hashToken(credential), hashToken(verifier));
+    const vaults = openPublicVaults(state, Date.now);
+    assert.equal(vaults.accountStatus().active, 2);
+    assert.throws(() => vaults.exchange(identify({ ...first, credential: token() }, profile)), /binding_required/);
+    assert.equal(vaults.exchange(identify(first, profile)).profileRegistered, true);
+    assert.equal(vaults.exchange(identify(second, { ...profile, userCode: '0000000041' })).profileRegistered, true);
+    assert.equal(vaults.accountStatus().active, 1);
+    assert.deepEqual(vaults.list().map(({ userCode, name }) => [userCode, name]),
+      [['0000000041', '演练账号甲'], ['0000000041', '演练账号甲']]);
+    assert.throws(() => vaults.exchange(identify(first, { ...profile, userCode: '42' })), /account_mismatch/);
+    assert.throws(() => vaults.register({ ...legacy(), profile }), { status: 409, message: 'public_recovery_required' });
+    assert.doesNotThrow(() => vaults.register({ ...first, profile }));
+    vaults.revoke(first.vault);
+    assert.equal(vaults.accountStatus().active, 1);
+    assert.equal(vaults.list().find(row => row.id === first.vault).userCode, undefined);
+    vaults.revoke(second.vault);
+    assert.equal(vaults.accountStatus().active, 0);
+    assert.doesNotThrow(() => vaults.register({ ...legacy(), profile }));
+  } finally { state.close(); }
+});
+
 test('the managed service keeps existing history and moves an explicitly linked account to device authentication', async t => {
   const id = gameKey('41'), now = Date.now();
   const match = { gameId: '213', mode: 26, rawMode: 132, rawGroup: 3, endedAt: now, duration: 120, result: 0, general: [1], position: 4 };
@@ -986,6 +1019,31 @@ test('HTTPS admin requires a password and limits sessions to the authenticated o
   assert.equal(previousHttp.status, 308);
   assert.equal(previousHttp.headers.get('location'), origin + '/updates/lite/toolbox.user.js');
   assert.equal((await post(env.server.syncUrl, '/v2/vault/register', {})).status, 426);
+  const publicPage = await secure(publicSharePath);
+  assert.equal(publicPage.status, 200);
+  assert.match(publicPage.headers['content-security-policy'], /connect-src 'self'/);
+  assert.equal(publicPage.headers['referrer-policy'], 'no-referrer');
+  assert.equal(publicPage.headers['cache-control'], 'no-store');
+  assert.match(publicPage.text, /分享的账本与战绩/);
+  const share = { origin, vault: token(), seed: token() };
+  const link = publicViewLink(share);
+  assert.deepEqual(readPublicView(link), share);
+  assert.throws(() => readPublicView(link.replace(origin, 'https://wrong.example.test')), /凭据格式无效/);
+  const passwordForView = randomPass(webcrypto);
+  const sharedCipher = await createVaultCipher(webcrypto, { ...share, password: passwordForView });
+  const writer = { vault: share.vault, verifier: sharedCipher.verifier, credential: token(),
+    profile: { userCode: '41', name: '仅管理员可见' } };
+  assert.equal((await secure('/v2/vault/register', writer)).status, 403);
+  assert.equal((await secure('/v2/vault/register', writer, { Origin: site })).status, 200);
+  const data = await sharedCipher.seal(['event', 'shared-event', { at: 1, items: [{ name: '演练道具', delta: 1 }] }]);
+  const preferences = await sharedCipher.seal(['preferences', 'toolbox', { compactOpacity: 80 }]);
+  assert.equal((await secure('/v2/vault/exchange', { ...writer, profile: undefined, revision: 0, records: [data, preferences] },
+    { Origin: site })).status, 200);
+  const view = { vault: share.vault, verifier: sharedCipher.verifier };
+  const viewed = await secure(publicViewPath, view);
+  assert.equal(viewed.status, 200);
+  assert.deepEqual(JSON.parse(viewed.text), { records: [data] });
+  assert.equal((await secure(publicViewPath, view, { Origin: 'https://untrusted.example.test' })).status, 403);
 
   const redirect = await secure('/admin');
   assert.equal(redirect.status, 308);
@@ -1009,7 +1067,10 @@ test('HTTPS admin requires a password and limits sessions to the authenticated o
   assert.equal(JSON.parse(status.text).mode, 'public');
   assert.equal(JSON.parse(status.text).publicPreview, true);
   assert.equal(JSON.parse(status.text).updates.url, origin + '/updates');
+  assert.equal(JSON.parse(status.text).vaults.find(row => row.id === share.vault).name, '仅管理员可见');
   assert.equal((await secure('/admin/public/preview', { enabled: false }, { Cookie })).status, 200);
+  assert.equal((await secure(publicSharePath)).status, 403);
+  assert.equal((await secure(publicViewPath, view)).status, 403);
   assert.equal(JSON.parse((await secure('/admin/status', null, { Cookie })).text).publicPreview, false);
   assert.equal((await fetch(env.server.adminUrl + '/admin/status', { headers: { Cookie } })).status, 401);
   assert.equal((await secure('/admin/status', null, { Cookie, 'Sec-Fetch-Site': 'cross-site' })).status, 403);
