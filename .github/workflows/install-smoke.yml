@@ -1,0 +1,63 @@
+name: Release installer smoke test
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install and reset on Ubuntu
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/releases/latest/download
+          curl -fsSL --retry 3 "$base/install-linux.sh" -o /tmp/install-sgs.sh
+          install=$(sudo sh /tmp/install-sgs.sh --host 127.0.0.1)
+          setup_code=$(printf '%s\n' "$install" | sed -n 's/^First setup code: //p')
+          admin_password=$(printf '%s\n' "$install" | sed -n 's/^Initial admin password: //p')
+          [[ "$setup_code" =~ ^[A-Za-z0-9_-]{43}$ && "$admin_password" =~ ^A1[A-Za-z0-9_-]{43}$ ]]
+          login() {
+            local port=$1 secret=$2
+            curl -fsS -H "Origin: http://127.0.0.1:$port" -H 'Content-Type: application/json' \
+              --data "{\"token\":\"$secret\"}" "http://127.0.0.1:$port/admin/login" >/dev/null
+          }
+          login 17431 "$setup_code"
+          login 17430 "$admin_password"
+          reset=$(sudo /opt/sgs-toolbox-sync/reset-admin-password)
+          reset=${reset#New admin password: }
+          [[ "$reset" =~ ^A1[A-Za-z0-9_-]{43}$ && "$reset" != "$admin_password" ]]
+          login 17430 "$reset"
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - name: Install and reset on Windows Server 2022
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:TEMP 'install-sgs.ps1'
+          $base = 'https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/releases/latest/download'
+          Invoke-WebRequest -Uri "$base/install-windows.ps1" -OutFile $installer
+          $results = @(powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -HostName '127.0.0.1')
+          if ($LASTEXITCODE) { throw 'Windows install failed.' }
+          function Read-Secret($Lines, $Label) {
+            foreach ($line in $Lines) { if ($line -match "^$Label ([A-Za-z0-9_-]{43,45})$") { return $Matches[1] } }
+            throw "Installer did not report $Label"
+          }
+          function Test-Login($Port, $Secret) {
+            $origin = "http://127.0.0.1:$Port"
+            $body = @{ token = $Secret } | ConvertTo-Json -Compress
+            $result = Invoke-RestMethod "$origin/admin/login" -Method Post -ContentType 'application/json' -Headers @{ Origin = $origin } -Body $body
+            if (-not $result.ok) { throw "Login failed on TCP $Port" }
+          }
+          Test-Login 17431 (Read-Secret $results 'First setup code:')
+          $admin = Read-Secret $results 'Initial admin password:'
+          Test-Login 17430 $admin
+          $control = Join-Path $env:ProgramFiles 'sgs-toolbox-sync\install-windows.ps1'
+          $reset = @(powershell.exe -NoProfile -ExecutionPolicy Bypass -File $control -ResetPassword)
+          if ($LASTEXITCODE) { throw 'Windows password reset failed.' }
+          $newPassword = Read-Secret $reset 'New admin password:'
+          if ($newPassword -eq $admin) { throw 'Password did not change.' }
+          Test-Login 17430 $newPassword

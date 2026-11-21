@@ -1,0 +1,9 @@
+# 三国杀 OL 工具箱同步服务端
+
+> 私有与公共加密同步服务，自带管理面板。一键安装支持 Ubuntu、Debian 和 x64 Windows Server。
+
+- [AI Agent 操作手册](https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/blob/main/AGENTS.md): 按用户任务定位步骤、端口、凭据用途和排查命令。
+- [安装、证书、改密、重置与升级](https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/blob/main/README.md): 面向服务器操作者的完整文档。
+- [正式发行版](https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/releases/latest): 安装脚本、运行包和散列。
+
+默认首次设置地址 http://SERVER:17431/admin/，使用终端显示的 First setup code（60 分钟）。正式管理员密码用于 HTTPS 管理面板或服务器本机的 http://127.0.0.1:17430/admin/。默认初始同步为本机 TCP 17429。公共同步使用用户设置的 HTTPS 端口，管理页路径为 /admin/，服务探针路径为 /health。

@@ -15,8 +15,8 @@
     </header>
     <form id="login" class="card" hidden>
       <h2>管理员登录</h2>
-      <label>管理员凭据<input id="token" type="password" required autocomplete="off"></label>
-      <p>输入管理员访问密码。</p>
+      <label><span id="login-label">管理员密码</span><input id="token" type="password" required maxlength="128" autocomplete="current-password"></label>
+      <p id="login-hint">输入管理员访问密码。</p>
       <button class="primary">登录</button>
     </form>
     <p id="notice" class="message" role="status" hidden></p>
@@ -36,6 +36,8 @@
             </form>
           </details>
         </div>
+        <p id="setup-hint" hidden></p>
+        <a id="setup-https" hidden>打开 HTTPS 管理面板</a>
         <div id="public-mode" hidden>
           <div class="copy-row"><label>工具箱绑定地址<input id="public-url" readonly></label><button id="copy-public-url" type="button">复制地址</button></div>
           <div class="toggle-row"><span id="public-preview-label">允许凭分享凭据和六位码查看流水与战绩</span><button id="public-preview" type="button"
@@ -55,11 +57,12 @@
           <form id="network">
             <div class="fields">
               <label>同步端口<input id="port" type="number" min="1" max="65535" required></label>
-              <label>域名或 IP<input id="domain" type="text" placeholder="localhost" autocomplete="off"></label>
+              <label><span id="domain-label">域名或 IP</span><input id="domain" type="text" placeholder="localhost" autocomplete="off"></label>
             </div>
             <div class="toggle-row"><span id="tls-label">SSL 证书</span><button type="button" id="tls" role="switch" aria-checked="false" aria-labelledby="tls-label"></button></div>
             <div id="cert-fields" hidden>
-              <div class="fields">
+              <p id="setup-pem-hint" hidden>将证书链和私钥放到服务端数据目录中的 setup-fullchain.pem 和 setup-privkey.pem，再保存设置。</p>
+              <div class="fields" id="pem-files">
                 <label>证书链 PEM<input type="file" id="cert" accept=".pem,.crt,.cer"></label>
                 <label>私钥 PEM<input type="file" id="key" accept=".pem,.key"></label>
               </div>
@@ -68,6 +71,7 @@
             </div>
             <button class="primary" id="save-network">保存网络设置</button>
           </form>
+          <div id="update-settings">
           <div class="section-title"><h2>更新镜像</h2></div>
           <div class="toggle-row"><span id="mirror-label">接管核心与插件更新</span><button type="button" id="mirror"
             role="switch" aria-checked="false" aria-labelledby="mirror-label"></button></div>
@@ -78,6 +82,7 @@
           <div class="entry-actions" id="server-update-actions" hidden>
             <button type="button" id="server-update-check">检查更新</button>
             <button type="button" id="server-update-install" class="primary" disabled>安装更新</button>
+          </div>
           </div>
         </section>
         <section class="card" id="installation-card">
@@ -103,6 +108,17 @@
             </div>
           </div>
           <button type="button" class="danger" id="release-installation" hidden>解除整个私有绑定</button>
+        </section>
+        <section class="card" id="security-card">
+          <h2>管理员密码</h2>
+          <form id="change-password">
+            <label>当前密码<input id="current-password" type="password" required maxlength="128" autocomplete="current-password"></label>
+            <label>新密码<input id="new-password" type="password" required minlength="8" maxlength="128" autocomplete="new-password" aria-describedby="password-hint"></label>
+            <label>确认新密码<input id="confirm-password" type="password" required minlength="8" maxlength="128" autocomplete="new-password"></label>
+            <p id="password-hint">至少 8 位，含英文字母和数字。保存后所有后台会话需要重新登录。</p>
+            <button class="primary">保存密码</button>
+          </form>
+          <p id="password-message" class="message" role="status" hidden></p>
         </section>
       </div>
       <div class="columns">

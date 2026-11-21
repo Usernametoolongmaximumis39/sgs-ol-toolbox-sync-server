@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+umask 077
+[ "$(id -u)" = 0 ] || { echo 'Run this password reset with sudo.' >&2; exit 1; }
+root=$(dirname "$(readlink -f "$0")")
+service=${root##*/}
+exec 9>"/run/lock/$service-install.lock"
+flock -n 9 || { echo 'An install or password reset is already running.' >&2; exit 1; }
+systemctl stop "$service"
+trap 'systemctl start "$service"' EXIT
+password=$(runuser -u "$service" -- "$root/runtime/node" "$root/current/tools/appearance-sync.mjs" \
+    --data-dir "/var/lib/$service" --reset-admin-password)
+systemctl start "$service"
+trap - EXIT
+printf 'New admin password: %s\n' "$password"

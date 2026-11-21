@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomBytes, webcrypto } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { copyFile, mkdtemp, readFile, readdir, rmdir, unlink } from 'node:fs/promises';
+import { copyFile, mkdtemp, readFile, readdir, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { tmpdir } from 'node:os';
@@ -11,6 +11,8 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { startAppearanceSync } from '../tools/appearance-sync.mjs';
 import { startManagedSync } from '../tools/sync-admin/server.mjs';
+import { createSetupCode } from '../tools/sync-admin/initial-setup.mjs';
+import { resetAdminPassword } from '../tools/sync-admin/admin-password.mjs';
 import { openState } from '../tools/sync-admin/state.mjs';
 import { openPublicVaults } from '../tools/sync-admin/public-vault.mjs';
 import { createPublicTransport, createVaultCipher, randomPass } from '../src/core/public-sync.js';
@@ -53,9 +55,9 @@ async function fixture(t, { legacy = false, seed, relocate = false, ...options }
   await start();
   return { get server() { return server; }, dir, now: () => now, advance: ms => { now += ms; }, start };
 }
-async function admin(server) {
+async function admin(server, password) {
   const origin = server.adminUrl;
-  const login = await post(origin, '/admin/login', { token: (await readFile(server.adminFile, 'utf8')).trim() }, { Origin: origin });
+  const login = await post(origin, '/admin/login', { token: password ?? (await readFile(server.adminFile, 'utf8')).trim() }, { Origin: origin });
   assert.equal(login.status, 200);
   const Cookie = login.headers.get('set-cookie').split(';')[0];
   return {
@@ -63,6 +65,37 @@ async function admin(server) {
     send: (path, value) => post(origin, '/admin/' + path, value, { Cookie, Origin: origin }),
   };
 }
+
+test('changing and resetting the administrator password preserve storage and revoke prior logins', async t => {
+  const env = await fixture(t);
+  const server = env.server;
+  const original = (await readFile(server.adminFile, 'utf8')).trim();
+  const first = await admin(server), second = await admin(server);
+  const password = 'NewAdmin8#🙂';
+  assert.equal((await first.send('password', { current: original, password: 'onlyletters' })).status, 400);
+  assert.equal((await first.send('password', { current: 'WrongPass1', password })).status, 401);
+  assert.equal((await first.send('password', { current: original, password })).status, 200);
+  assert.equal((await second.get('/admin/status')).status, 401);
+  const signIn = (value, target = env.server) => post(target.adminUrl, '/admin/login', { token: value }, { Origin: target.adminUrl });
+  assert.equal((await signIn(original)).status, 401);
+  const record = await readFile(server.adminFile, 'utf8');
+  assert.match(record, /^scrypt:[a-f0-9]{32}:[a-f0-9]{64}\n$/);
+  assert.equal(record.includes(password), false);
+  const current = await admin(server, password);
+  assert.equal((await current.send('limit', { limit: 3 })).status, 200);
+  const originalState = await (await current.get('/admin/status')).json();
+  await server.close();
+  await env.start();
+  assert.equal((await signIn(password)).status, 200);
+  await env.server.close();
+  const reset = await resetAdminPassword(env.dir);
+  assert.match(reset, /^A1[A-Za-z0-9_-]{43}$/);
+  await env.start();
+  assert.equal((await signIn(password)).status, 401);
+  const restoredState = await (await (await admin(env.server, reset)).get('/admin/status')).json();
+  assert.equal(restoredState.mode, originalState.mode);
+  assert.equal(restoredState.limit, originalState.limit);
+});
 async function invite(operator, options = {}, request = null) {
   request ??= await createPairingRequest(webcrypto);
   const response = await operator.send('invite', { request: request.code, uses: 1, hours: 24, ...options });
@@ -580,6 +613,60 @@ async function testCertificate(dir, domain = 'localhost') {
   }
   return null;
 }
+
+test('temporary HTTP setup accepts only its setup code and closes after HTTPS admin login', async t => {
+  const setupPort = await freePort();
+  let code, password;
+  const env = await fixture(t, { setupHost: '127.0.0.1', setupPort, publicNetwork: true, privateNetwork: true, httpsAdmin: true,
+    async seed(dir) { password = await resetAdminPassword(dir); code = await createSetupCode(dir); } });
+  const setup = `http://127.0.0.1:${setupPort}`;
+  assert.match(await (await fetch(setup + '/admin/')).text(), /data-initial-setup/);
+  assert.equal((await fetch(setup + '/health')).status, 404);
+  assert.equal((await post(setup, '/admin/login', { token: code }, { Origin: site })).status, 403);
+  assert.equal((await post(setup, '/admin/login', { token: password }, { Origin: setup })).status, 401);
+  const setupLogin = await post(setup, '/admin/login', { token: code }, { Origin: setup });
+  assert.equal(setupLogin.status, 200);
+  const Cookie = setupLogin.headers.get('set-cookie').split(';')[0];
+  assert.match(Cookie, /^sgs_sync_setup=/);
+  assert.equal((await fetch(env.server.adminUrl + '/admin/status', { headers: { Cookie } })).status, 401);
+  const status = await (await fetch(setup + '/admin/status', { headers: { Cookie } })).json();
+  assert.equal(status.initialSetup, true);
+  assert.equal(Object.hasOwn(status, 'accounts'), false);
+  const setupPost = (path, body) => post(setup, '/admin/' + path, body, { Origin: setup, Cookie });
+  assert.equal((await setupPost('password', { current: code, password: 'NewPassword1' })).status, 403);
+  assert.equal((await setupPost('network', { port: 8888, domain: 'sync.example.test', tls: false })).status, 403);
+  const domain = 'sync.example.test', port = await freePort();
+  const network = { port, domain, tls: true };
+  let response = await setupPost('network', network);
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error, 'setup_pem_missing');
+  const certificate = await testCertificate(env.dir, domain);
+  if (!certificate) return t.skip('OpenSSL CLI unavailable');
+  await writeFile(join(env.dir, 'setup-fullchain.pem'), certificate.cert);
+  await writeFile(join(env.dir, 'setup-privkey.pem'), certificate.key);
+  assert.equal((await setupPost('network', network)).status, 200);
+  assert.equal((await setupPost('public/enable', { confirm: '转为公共' })).status, 200);
+  const authority = `${domain}:${port}`;
+  const secure = value => new Promise((resolve, reject) => {
+    const request = httpsRequest({ host: '127.0.0.1', port, path: '/admin/login', servername: domain, ca: certificate.cert,
+      method: 'POST', headers: { Host: authority, Origin: 'https://' + authority, 'Content-Type': 'application/json' } },
+    result => { result.resume(); resolve(result.statusCode); });
+    request.on('error', reject).end(JSON.stringify({ token: value }));
+  });
+  assert.equal(await secure(code), 401);
+  assert.equal(await secure(password), 200);
+  await assert.rejects(readFile(join(env.dir, 'initial-setup.json')), { code: 'ENOENT' });
+  await assert.rejects(fetch(setup + '/admin/'));
+});
+
+test('an expired first-setup code cannot authenticate over HTTP', async t => {
+  const setupPort = await freePort();
+  let code;
+  const env = await fixture(t, { setupHost: '127.0.0.1', setupPort, async seed(dir) { code = await createSetupCode(dir); } });
+  const setup = `http://127.0.0.1:${setupPort}`;
+  env.advance(61 * 60_000);
+  assert.equal((await post(setup, '/admin/login', { token: code }, { Origin: setup })).status, 410);
+});
 
 test('loopback TLS validates certificate names and restricts plaintext redirects', async t => {
   const env = await fixture(t), operator = await admin(env.server);

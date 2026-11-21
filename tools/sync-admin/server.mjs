@@ -2,7 +2,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { createSecureContext } from 'node:tls';
 import { randomBytes, randomInt, sign, webcrypto, X509Certificate } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { isIPv4 } from 'node:net';
@@ -18,6 +18,8 @@ import { PREFERENCES_LIMIT, PREFERENCES_SYNC_PATH } from '../../src/shared/sync-
 import { SYNC_SOURCE_HEADER } from '../../src/shared/private-sync-http.js';
 import { openUpdateMirror } from './update-mirror.mjs';
 import { openServerUpdate } from './server-update.mjs';
+import { openAdminPassword, resetAdminPassword, validAdminPassword } from './admin-password.mjs';
+import { createSetupCode, readInitialSetup } from './initial-setup.mjs';
 
 const host = '127.0.0.1';
 const grace = 60 * 60000;
@@ -28,6 +30,7 @@ const pairingPaths = new Set(['/v1/proof', '/v1/bind', '/v1/recover', '/v1/confi
 const vaultPaths = new Set(['/v2/vault/register', '/v2/vault/exchange', '/v2/vault/view', '/v2/migrate/read', '/v2/migrate/stage']);
 const nonceFormat = /^[A-Za-z0-9_-]{22}$/;
 const maxAdminBody = 128 * 1024;
+const setupNetworkPaths = ['/admin/status', '/admin/network', '/admin/cancel', '/admin/public/enable'];
 const httpUrl = port => new URL(`http://${host}:${port}`).origin;
 const endpointUrl = ({ tls, domain, port }) => new URL(`${tls ? 'https' : 'http'}://${domain || host}:${port}`).origin;
 const asInvite = config => ({ ...config, ipv4: host, local: true });
@@ -96,13 +99,13 @@ function statusOf(config) {
 
 export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = false, port = 17429, adminPort = 17430, now = Date.now,
   interval = true, allowedOrigins = syncOrigins, publicNetwork = false, privateNetwork = false, relocate = false, legacyInvitations = false,
-  httpsAdmin = false, updateFetch, updateToken, serverUpdateDir } = {}) {
+  httpsAdmin = false, updateFetch, updateToken, serverUpdateDir, setupHost, setupPort = 17431 } = {}) {
   requireValue(!httpsAdmin || publicNetwork, 'https_admin_requires_public_network');
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const adminFile = join(dataDir, 'admin-token');
-  try { await writeFile(adminFile, token() + '\n', { mode: 0o600, flag: 'wx' }); }
-  catch (error) { if (error.code !== 'EEXIST') throw error; }
-  const adminDigest = hash((await readFile(adminFile, 'utf8')).trim());
+  const adminPassword = await openAdminPassword(adminFile);
+  let initialSetup = await readInitialSetup(dataDir, setupHost, setupPort, now);
+  let setupServer, setupTimeout;
   const store = openState(join(dataDir, 'sync.sqlite3'), port, now);
   const vaults = openPublicVaults(store, now);
   const preferences = openPrivatePreferences(store);
@@ -421,7 +424,8 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
     requireValue(!publicMode() || config.tls, 'https_required', 426);
     requireValue(!publicMode() || !publicNetwork || !isLocalDomain(config.domain) && !isIPv4(config.domain), 'public_domain_required');
     const adminPort = admin.address().port;
-    requireValue(config.port !== adminPort && config.redirectPort !== adminPort, 'port_in_use', 409);
+    const reserved = [adminPort, initialSetup && setupPort];
+    requireValue(!reserved.includes(config.port) && !reserved.includes(config.redirectPort), 'port_in_use', 409);
     if (config.port === active.config.port) {
       requireValue(config.tls === active.config.tls && config.domain === active.config.domain, 'new_port_required', 409);
       const oldRedirect = active.redirect;
@@ -458,15 +462,19 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
     migrationError = '';
     await closeData(previous, active.redirect);
   }
-  async function status() {
+  async function status(setup = false) {
     const serverUpdateStatus = await serverUpdate.status();
     const staged = network.candidate;
     const shared = publicMode(), tls = publicConfig();
     const updateEndpoint = shared && !active.config.tls ? tls : active.config;
+    const base = { mode: shared ? 'public' : 'private', publicUrl: tls ? endpointUrl(tls) : null, initialSetup: setup, publicNetwork,
+      activeEndpoint: statusOf(network.active),
+      candidate: staged ? { ...statusOf(staged.config), listening: Boolean(candidate), confirmedAt: staged.confirmedAt,
+        deadline: staged.confirmedAt === null ? null : staged.confirmedAt + grace, error: migrationError } : null };
+    if (setup) return { ...base, used: Boolean(activeHistory().length || store.privateOwner() || store.archivedStores().length) };
     const info = store.list(), labels = new Map(shared ? [] : data.listAccounts().map(row => [row.key, row.label]));
     return { ...info, accounts: shared ? [] : info.accounts.map(row => ({ ...row, label: labels.get(row.storeKey) ?? row.userCode })),
-      activeEndpoint: statusOf(network.active),
-      mode: shared ? 'public' : 'private', publicUrl: tls ? endpointUrl(tls) : null, publicPreview: canPreview(), publicNetwork,
+      ...base, publicPreview: canPreview(),
       privateNetwork: !shared && privateNetwork,
       recoveryPending: !shared && store.archivedStores().length > 0,
       updates: { ...updates.status(), url: updateEndpoint ? endpointUrl(updateEndpoint) + '/updates' : null },
@@ -475,11 +483,19 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
       vaults: shared ? vaults.list() : [],
       migration: !shared && tls ? migrationStatus() : [],
       existingAccounts: !shared && legacy ? activeHistory().filter(row => !store.isManagedStore(row.key)).map(({ key, label }) => ({ key, label })) : [],
-      candidate: staged ? { ...statusOf(staged.config), listening: Boolean(candidate), confirmedAt: staged.confirmedAt,
-        deadline: staged.confirmedAt === null ? null : staged.confirmedAt + grace, error: migrationError } : null };
+    };
   }
 
-  async function handleAdmin(request, response, adminAddress) {
+  async function disableInitialSetup() {
+    if (!initialSetup) return;
+    await initialSetup.disable();
+    initialSetup = null;
+    clearTimeout(setupTimeout);
+    for (const [key, session] of sessions) if (session.setup) sessions.delete(key);
+    await closeServer(setupServer);
+  }
+
+  async function handleAdmin(request, response, adminAddress, setup = false) {
     const secure = adminAddress.startsWith('https:');
     const site = request.headers['sec-fetch-site'];
     const landing = request.method === 'GET' && ['/admin', '/admin/'].includes(request.url)
@@ -490,36 +506,69 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
     if (request.method === 'GET' && request.url === '/admin') {
       return response.writeHead(308, { Location: '/admin/' }).end();
     }
-    const cookieName = secure ? '__Host-sgs_sync_admin' : 'sgs_sync_admin';
+    const cookieName = secure ? '__Host-sgs_sync_admin' : setup ? 'sgs_sync_setup' : 'sgs_sync_admin';
     const cookie = (request.headers.cookie ?? '').split(';').map(value => value.trim())
       .find(value => value.startsWith(cookieName + '='));
     const sessionKey = cookie?.slice(cookieName.length + 1);
     const session = isToken(sessionKey) && sessions.get(hash(sessionKey));
-    const loggedIn = session && session.origin === adminAddress && session.expires > now();
+    const loggedIn = session && session.origin === adminAddress && session.setup === setup && session.expires > now();
     if (request.url === '/admin/login') {
       const body = await readPost(request, 1024);
-      if (secure) attempt(request.socket.remoteAddress, 12, 60000, httpsAdminAttempts);
+      if (secure || setup) attempt(request.socket.remoteAddress, 12, 60000, httpsAdminAttempts);
       else attempt('admin-login', 12, 60000);
-      requireValue(isToken(body.token) && equal(hash(body.token), adminDigest), 'invalid_admin_token', 401);
+      requireValue(setup ? initialSetup?.verify(body.token) : await adminPassword.verify(body.token), 'invalid_admin_token', 401);
+      if (secure && initialSetup) await disableInitialSetup();
       for (const [key, value] of sessions) if (value.expires <= now()) sessions.delete(key);
       if (sessions.size >= 64) sessions.delete(sessions.keys().next().value);
       const session = token();
-      sessions.set(hash(session), { origin: adminAddress, expires: now() + 8 * 3600000 });
+      sessions.set(hash(session), { origin: adminAddress, expires: now() + 8 * 3600000, setup });
       response.setHeader('Set-Cookie', `${cookieName}=${session}; Path=/; HttpOnly; SameSite=Strict; Max-Age=28800${secure ? '; Secure' : ''}`);
       return send(response, 200, { ok: true });
     }
     if (request.method === 'GET' && Object.hasOwn(assets, request.url)) {
       const [file, type] = assets[request.url];
       response.writeHead(200, { 'Content-Type': type + '; charset=utf-8' });
-      return response.end(await readFile(new URL('./' + file, import.meta.url)));
+      const contents = await readFile(new URL('./' + file, import.meta.url), 'utf8');
+      return response.end(setup && file === 'index.html' ? contents.replace('<body>', '<body data-initial-setup>') : contents);
     }
     requireValue(loggedIn, 'admin_required', 401);
+    requireValue(!setup || setupNetworkPaths.includes(request.url),
+      'setup_restricted', 403);
+    if (request.url === '/admin/password') {
+      const body = await readPost(request, 4096);
+      requireValue(validAdminPassword(body.password), 'invalid_admin_password');
+      await serialize(async () => {
+        requireValue(sessions.get(hash(sessionKey)) === session && session.expires > now(), 'admin_required', 401);
+        if (secure) attempt(request.socket.remoteAddress, 12, 60000, httpsAdminAttempts);
+        else attempt('admin-login', 12, 60000);
+        requireValue(await adminPassword.verify(body.current), 'invalid_admin_token', 401);
+        await adminPassword.change(body.password);
+        sessions.clear();
+      });
+      response.setHeader('Set-Cookie', `${cookieName}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure ? '; Secure' : ''}`);
+      return send(response, 200, { ok: true });
+    }
     if (request.url.startsWith('/ledger/')) {
       requireValue(!publicMode(), 'public_mode_required', 404);
       return data.handle(request, response, { preview: true, allowPreviewAccount: key => !store.isArchivedStore(key) });
     }
-    if (request.method === 'GET' && request.url === '/admin/status') return send(response, 200, await status());
-    const body = await readPost(request, maxAdminBody);
+    if (request.method === 'GET' && request.url === '/admin/status') return send(response, 200, await status(setup));
+    const body = await readPost(request, setup ? 4096 : maxAdminBody);
+    if (setup) {
+      requireValue(!publicMode() && !activeHistory().length && !store.privateOwner() && !store.archivedStores().length, 'setup_restricted', 403);
+      if (request.url === '/admin/network') {
+        requireValue(body.tls && !body.cert && !body.key, 'setup_restricted', 403);
+        const domain = typeof body.domain === 'string' ? body.domain.trim().toLowerCase() : '';
+        requireValue(!isLocalDomain(domain) && !isIPv4(domain), 'public_domain_required');
+        try {
+          body.cert = await readFile(join(dataDir, 'setup-fullchain.pem'), 'utf8');
+          body.key = await readFile(join(dataDir, 'setup-privkey.pem'), 'utf8');
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          throw new SyncError(400, 'setup_pem_missing');
+        }
+      }
+    }
     if (publicMode()) requireValue(['/admin/network', '/admin/cancel', '/admin/public/preview', '/admin/public/revoke',
       '/admin/public/limit', '/admin/updates', '/admin/server-update'].includes(request.url),
       'public_mode_required', 409);
@@ -625,14 +674,15 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
       }
       default: throw new SyncError(404, 'not_found');
     }
-    return send(response, 200, await status());
+    return send(response, 200, await status(setup));
   }
   async function close() {
     if (closed) return;
     closed = true;
     clearInterval(counter);
+    clearTimeout(setupTimeout);
     await pending;
-    await Promise.all([closeData(active), closeData(candidate, active?.redirect), closeServer(admin), updates.close()]);
+    await Promise.all([closeData(active), closeData(candidate, active?.redirect), closeServer(admin), closeServer(setupServer), updates.close()]);
     await data.close();
     store.close();
   }
@@ -661,6 +711,17 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
       return handleAdmin(request, response, address);
     }));
     await listen(admin, adminPort);
+    if (initialSetup) {
+      setupServer = http.createServer(settings, safeHandler((request, response) => {
+        requireValue(initialSetup && initialSetup.expiresAt > now(), 'setup_expired', 410);
+        checkHost(request, [new URL(initialSetup.address).host], true);
+        requireValue(request.url === '/admin' || request.url.startsWith('/admin/'), 'not_found', 404);
+        return handleAdmin(request, response, initialSetup.address, true);
+      }));
+      await listen(setupServer, setupPort, '0.0.0.0');
+      setupTimeout = setTimeout(() => { void disableInitialSetup().catch(() => {}); }, initialSetup.expiresAt - now());
+      setupTimeout.unref();
+    }
     if (interval) counter = setInterval(() => { void serialize(settle).catch(() => { migrationError = 'storage_error'; }); }, 1000);
   } catch (error) { await close(); throw error; }
   return { adminUrl: httpUrl(admin.address().port), adminFile, get syncUrl() { return endpointUrl(active.config); },
@@ -670,6 +731,10 @@ export async function startManagedSync({ dataDir, dataFile, catalogue, legacy = 
 export async function runManagedSync(args) {
   const { values } = parseArgs({ args, options: {
     'data-dir': { type: 'string', default: 'data/appearance-sync' },
+    'reset-admin-password': { type: 'boolean', default: false },
+    'create-setup-code': { type: 'boolean', default: false },
+    'setup-host': { type: 'string' },
+    'setup-port': { type: 'string', default: '17431' },
     port: { type: 'string', default: '17429' },
     'admin-port': { type: 'string', default: '17430' },
     'existing-data': { type: 'boolean', default: false },
@@ -679,8 +744,17 @@ export async function runManagedSync(args) {
     'private-network': { type: 'boolean', default: false },
     relocate: { type: 'boolean', default: false },
   } });
-  const port = Number(values.port), adminPort = Number(values['admin-port']);
-  if (![port, adminPort].every(value => Number.isInteger(value) && value >= 1 && value <= 65535) || port === adminPort) throw new Error('端口无效');
+  if (values['reset-admin-password']) {
+    console.log(await resetAdminPassword(resolve(values['data-dir'])));
+    return;
+  }
+  if (values['create-setup-code']) {
+    console.log(await createSetupCode(resolve(values['data-dir'])));
+    return;
+  }
+  const port = Number(values.port), adminPort = Number(values['admin-port']), setupPort = Number(values['setup-port']);
+  const ports = values['setup-host'] ? [port, adminPort, setupPort] : [port, adminPort];
+  if (!ports.every(value => Number.isInteger(value) && value >= 1 && value <= 65535) || new Set(ports).size !== ports.length) throw new Error('端口无效');
   const legacy = values['existing-data'];
   if (legacy) await readFile(EXISTING_SYNC_FILE).catch(error => {
     if (error.code === 'ENOENT') throw new Error('现有同步数据文件不存在');
@@ -689,6 +763,7 @@ export async function runManagedSync(args) {
   const service = await startManagedSync({ dataDir: resolve(values['data-dir']), port, adminPort,
     dataFile: legacy ? EXISTING_SYNC_FILE : undefined, legacy, publicNetwork: values['public-network'],
     privateNetwork: values['private-network'], httpsAdmin: values['https-admin'], relocate: values.relocate,
+    setupHost: values['setup-host'], setupPort,
     updateToken: process.env.SGS_TOOLBOX_GITHUB_READ_TOKEN,
     serverUpdateDir: values['server-update-dir'] && resolve(values['server-update-dir']) });
   console.log('账本与战绩同步 ' + service.syncUrl);

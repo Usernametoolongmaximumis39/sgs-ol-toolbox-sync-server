@@ -7,6 +7,7 @@ const messages = {
   invalid_account_limit: '名额需为 1–100，且至少等于已绑定账号数',
   invalid_public_account_limit: '最大绑定账号数必须是有效的非负整数',
   invalid_admin_token: '管理员凭据无效',
+  invalid_admin_password: '新密码需为 8–128 位，含英文字母和数字，且不能包含控制字符',
   invalid_certificate: '证书、私钥、有效期或域名不匹配',
   invalid_loopback_domain: '请输入有效地址。仅本机模式支持 localhost 或其子域名。',
   invalid_pairing_request: '配对请求格式错误，请重新复制',
@@ -34,6 +35,9 @@ const messages = {
   server_update_unavailable: '当前安装方式未启用服务端自更新',
   server_update_busy: '正在处理上一项更新请求',
   server_update_version_changed: '可用版本已变化，请重新检查',
+  setup_restricted: '首次设置仅可在新实例上配置 HTTPS 和切换公共模式',
+  setup_pem_missing: '服务端数据目录缺少证书链或私钥文件，请按安装文档放置后重试',
+  setup_expired: '首次设置入口已到期，请通过回环管理地址继续',
 };
 const number = id => Number($(id).value);
 const enabled = id => $(id).getAttribute('aria-checked') === 'true';
@@ -54,6 +58,8 @@ function showLogin() {
   $('dashboard').hidden = $('preview').hidden = true;
   for (const id of ['invite-code', 'update-code', 'private-credential']) $(id).value = '';
   $('issued').hidden = $('updated').hidden = $('credential-issued').hidden = true;
+  $('change-password').reset();
+  $('password-message').hidden = true;
   closeDeviceName();
 }
 async function api(path, body) {
@@ -270,6 +276,40 @@ function renderLists(state) {
   for (const row of state.existingAccounts) $('accounts').append(entry(row.label + ' · 历史待关联'));
 }
 let canConvert = false;
+const initialSetup = document.body.hasAttribute('data-initial-setup');
+if (initialSetup) {
+  $('login-label').textContent = '首次设置码';
+  $('login-hint').textContent = '输入安装程序显示的首次设置码。管理员密码在 HTTPS 或回环管理页使用。';
+  $('token').autocomplete = 'off';
+  $('domain-label').textContent = '同步域名';
+  $('domain').placeholder = 'sync.example.com';
+}
+function renderSetup(state, resetSettings) {
+  const shared = state.mode === 'public', active = state.activeEndpoint, candidate = state.candidate;
+  $('preview').hidden = $('installation-card').hidden = $('security-card').hidden = $('accounts-card').hidden = true;
+  $('update-settings').hidden = $('public-mode').hidden = $('pem-files').hidden = true;
+  $('private-mode').hidden = shared || state.used;
+  $('setup-pem-hint').hidden = $('setup-hint').hidden = false;
+  $('server-mode').textContent = shared ? '公共' : '私有';
+  $('network-scope').textContent = '首次设置';
+  $('setup-hint').textContent = shared ? '用安装程序显示的管理员密码登录 HTTPS 管理面板。登录成功后，此 HTTP 入口关闭。'
+    : '配置公网域名和 HTTPS 端口后，可将此实例转为公共服务器。';
+  $('setup-https').hidden = !shared || !state.publicUrl;
+  if (!$('setup-https').hidden) $('setup-https').href = state.publicUrl + '/admin/';
+  $('network').hidden = shared || state.used;
+  $('active-address').textContent = '同步端口 ' + active.port;
+  $('migration').hidden = !candidate || shared;
+  $('candidate').textContent = candidate ? '新 HTTPS 端口 ' + candidate.port : '';
+  $('save-network').disabled = Boolean(candidate);
+  canConvert = Boolean(state.publicUrl) && !state.used;
+  $('enable-public-button').disabled = !canConvert;
+  $('transition-readiness').textContent = canConvert ? 'HTTPS 已就绪。' : '请先配置 HTTPS 证书和端口。';
+  if (resetSettings) {
+    fillNetwork(candidate || { ...active, port: 8888, tls: true });
+    $('tls').disabled = true;
+  }
+  showCertificate(active, candidate);
+}
 function render(state, resetSettings = false) {
   loggedIn = true;
   $('login').hidden = true;
@@ -277,6 +317,7 @@ function render(state, resetSettings = false) {
   const supportsManagement = hasPrivateManagement(state);
   const waitingForUpdate = !shared && !supportsManagement && bound;
   $('dashboard').hidden = false;
+  if (state.initialSetup) { renderSetup(state, resetSettings); return; }
   $('preview').hidden = shared;
   $('private-mode').hidden = $('installation-card').hidden = shared;
   $('public-mode').hidden = !shared;
@@ -357,10 +398,29 @@ async function copy(id) {
 }
 
 setSubmit($('login'), async () => {
-  await api('login', { token: $('token').value.trim() });
+  await api('login', { token: $('token').value });
   $('token').value = '';
   render(await api('status'), true);
   notice('');
+});
+
+setSubmit($('change-password'), async () => {
+  const message = $('password-message');
+  message.hidden = true;
+  const current = $('current-password').value;
+  const password = $('new-password').value;
+  try {
+    if (password !== $('confirm-password').value) throw new Error('两次输入的新密码不一致');
+    await api('password', { current, password });
+    showLogin();
+    $('token').focus();
+    notice('密码已保存，请用新密码登录');
+  } catch (error) {
+    if (!loggedIn) throw error;
+    message.textContent = error.message;
+    message.dataset.error = 'true';
+    message.hidden = false;
+  }
 });
 setSubmit($('network'), async () => {
   const tls = enabled('tls');
