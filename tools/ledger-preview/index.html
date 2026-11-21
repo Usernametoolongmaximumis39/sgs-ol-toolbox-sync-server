@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>账本 · 本机预览</title>
+  <link rel="stylesheet" href="/ledger/preview.css">
+  <script src="/ledger/preview.js" type="module"></script>
+</head>
+<body>
+  <main>
+    <header class="page-header">
+      <div>
+        <h1>账本预览</h1>
+        <p class="muted" id="sync-time">正在读取本机记录…</p>
+      </div>
+      <div class="actions">
+        <input id="account-search" type="search" aria-label="查询账号" placeholder="10 位用户码或昵称" maxlength="100" autocomplete="off">
+        <div class="account" hidden><select id="account" aria-label="选择账号"></select></div>
+        <button type="button" id="reload">刷新预览</button>
+      </div>
+    </header>
+    <p id="error" role="alert" hidden></p>
+    <section aria-labelledby="balance-title">
+      <h2 id="balance-title">重要物品 <span>上次有效观察</span></h2>
+      <div class="balances" id="balances"></div>
+    </section>
+    <section aria-label="同步记录" class="history">
+      <div class="history-header">
+        <div class="segments" role="group" aria-label="记录类型">
+          <button type="button" data-stream="events" aria-pressed="true">道具流水</button>
+          <button type="button" data-stream="matches" aria-pressed="false">战绩与出框</button>
+          <button type="button" data-stream="review" aria-pressed="false">待核对</button>
+        </div>
+        <input id="search" type="search" aria-label="搜索记录" maxlength="80" placeholder="道具名称或 ID">
+      </div>
+      <div class="filters" id="filters">
+        <label class="time-filter">开始时间 <input id="from" type="datetime-local"></label>
+        <label class="time-filter">结束时间 <input id="to" type="datetime-local"></label>
+        <label data-event-filter>登录范围 <select id="period">
+          <option value="all">全部登录</option>
+          <option value="session">最近一次登录</option>
+        </select></label>
+        <label data-event-filter>流水类型 <select id="kind">
+          <option value="all">全部日志</option>
+          <option value="goods">物品流水</option>
+          <option value="prayer">祈愿台</option>
+        </select></label>
+        <label data-match-filter hidden>对局模式 <select id="match-mode">
+          <option value="0">全部模式</option>
+          <option value="26">排位赛</option>
+          <option value="35">斗地主</option>
+          <option value="44">单骑无双</option>
+        </select></label>
+        <label data-match-filter hidden>身份或先后手 <select id="match-side">
+          <option value="all">不限</option>
+        </select></label>
+        <label data-match-filter hidden>对局结果 <select id="match-result">
+          <option value="all">全部结果</option>
+          <option value="win">胜利</option>
+          <option value="loss">失败</option>
+          <option value="draw">平局</option>
+        </select></label>
+        <label data-match-filter hidden>出框记录 <select id="match-frame">
+          <option value="all">全部对局</option>
+          <option value="with">已记录出框</option>
+          <option value="without">未记录出框</option>
+        </select></label>
+      </div>
+      <div class="result-header">
+        <p class="muted" id="summary" role="status"></p>
+        <button type="button" id="export" disabled>导出查询结果</button>
+      </div>
+      <div id="amounts" class="amounts" aria-label="筛选结果收支合计" hidden></div>
+      <ul id="rows"></ul>
+      <nav id="pages" aria-label="记录分页" hidden>
+        <button type="button" id="prev">上一页</button>
+        <span class="muted" id="page"></span>
+        <button type="button" id="next">下一页</button>
+      </nav>
+    </section>
+  </main>
+</body>
+</html>

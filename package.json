@@ -1,0 +1,18 @@
+{
+  "name": "sgs-ol-toolbox-sync-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node tools/appearance-sync.mjs",
+    "test": "node --test tests/managed-sync.test.js",
+    "pack:release": "node distribution/pack-release.mjs"
+  },
+  "dependencies": {
+    "@hpke/core": "1.10.1"
+  }
+}
