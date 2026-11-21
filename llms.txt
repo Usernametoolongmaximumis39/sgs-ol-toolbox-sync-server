@@ -1,9 +1,20 @@
 # 三国杀 OL 工具箱同步服务端
 
-> 私有与公共加密同步服务，自带管理面板。一键安装支持 Ubuntu、Debian 和 x64 Windows Server。
+> 提供工具箱设置、账本和战绩同步。一键安装支持采用 systemd 的 Ubuntu／Debian 和 x64 Windows Server。
 
-- [AI Agent 操作手册](https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/blob/main/AGENTS.md): 按用户任务定位步骤、端口、凭据用途和排查命令。
-- [安装、证书、改密、重置与升级](https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/blob/main/README.md): 面向服务器操作者的完整文档。
-- [正式发行版](https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/releases/latest): 安装脚本、运行包和散列。
+## 文档入口
 
-新实例默认私有同步，并启用 HTTP 管理 http://SERVER:17431/admin/。安装输出含网址、登录密码及有效 60 分钟的首次设置码。HTTP 管理长期有效，可在「管理入口」主动关闭或修改公网管理路径。证书和 HTTPS 监听就绪后强制 HTTPS，才能在面板里转公共。默认初始同步为本机 TCP 17429，服务探针路径为 /health。
+- [AI 助手操作手册](https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/blob/main/AGENTS.md) — 按任务找入口，区分端口、凭据和成功条件。
+- [服务端 README](https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/blob/main/README.md) — 安装、私有配对、公共同步、应急访问、密码和更新。
+- [Node.js 镜像安装](https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/blob/main/README.md#通过镜像下载-nodejs) — Ubuntu／Debian 和 Windows Server 命令，校验文件来自 Node.js 官网。
+- [更换同步地址或端口](https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/blob/main/README.md#更换同步地址或端口) — 同时换端口的条件、工具箱认证和旧端口退出时间。
+- [正式版下载](https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/releases/latest) — Linux 和 Windows 安装脚本、运行包与 SHA-256。
+
+## 运行要点
+
+- 新实例默认私有。17429 是初始本机同步端口，17430 是本机应急管理端口，17431 是一键安装时启用的公网 HTTP 管理端口。管理页初始路径为 /admin/。
+- 私有 HTTP 无需证书。跨设备私有 HTTP 可使用客户端可达的 IPv4 或域名，限可信网络使用。公共模式需要受信任的域名证书和 HTTPS。
+- 新增或修改同步域名、IPv4，或更换 HTTP／HTTPS 时必须同时换端口。候选端口由实际工具箱认证后开始计时，60 分钟后转正并释放旧端口。/health 成功只代表连通，未认证时持续待确认。
+- 管理员密码用于日常管理。首次设置码只用于经公网 HTTP 配置全新公共实例，自生成起有效 60 分钟，首次成功登录 HTTPS 后台也会使它失效。
+- 公共模式需要有效的域名证书和 HTTPS 同步端口。已有私有历史须先准备加密副本。进入公共模式后，可在同一 HTTPS 地址访问管理页。
+- /health 加在同步地址后面。管理端口用登录页检查。后台「服务端自更新」升级 Linux 服务，Windows 用原任务名重跑安装器。「更新镜像」提供工具箱客户端和插件的下载。

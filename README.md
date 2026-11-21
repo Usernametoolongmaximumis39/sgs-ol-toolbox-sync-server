@@ -1,14 +1,26 @@
 # 三国杀 OL 工具箱同步服务端
 
-为工具箱提供私有或公共加密同步，也可镜像 Lite 核心与插件更新。公共服务强制 HTTPS，默认最多绑定 10 个账号。分享查看默认开启，查看者需要分享凭据及六位码。
+为工具箱同步设置、账本和战绩，也可镜像 Lite 核心与插件更新。新实例默认私有，服务器可以读取私有同步数据。公共模式允许多个用户分别绑定，工具箱在上传前加密数据，默认最多绑定 10 个账号。分享查看默认开启，查看者需要分享凭据及六位码。
 
 [发行版与下载](https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/releases/latest) · [AI Agent 操作手册](AGENTS.md) · [llms.txt](llms.txt)
+
+## 先选私有或公共
+
+| 使用场景 | 同步地址 | 证书要求 |
+| --- | --- | --- |
+| 私有，工具箱和服务在同一台电脑 | `http://127.0.0.1:17429`（默认） | 无需证书或域名 |
+| 私有，自己的其他设备跨机连接 | `http://客户端可达的IPv4或域名:新端口` | HTTP 无需证书。仅在可信网络使用 HTTP，传输未加密。选择 HTTPS 时才准备证书 |
+| 公共，供多个用户分别绑定 | `https://sync.example.com:8888`（示例） | 需要可解析的域名和客户端信任的 TLS 证书，提交 PEM 完整证书链及配套私钥 |
+
+跨设备访问或填写域名时，可以继续使用私有模式。只有确定要提供公共同步时，才进入[开启公共同步](#开启公共同步)并执行不可逆的模式转换。
 
 ## 一键安装
 
 安装程序下载此仓库最新的正式 Release，校验 SHA-256，安装专用 Node.js，并设置开机启动。Ubuntu、Debian 通过 systemd 运行，Windows Server 原生通过任务计划程序运行。
 
 新实例默认以**私有同步**运行。安装程序默认启用 HTTP 管理页，安装后可直接在自己的电脑打开终端打印的链接。在云安全组将管理端口 TCP `17431` 放行给自己的公网 IP。主机防火墙启用时，也要放行该连接。
+
+如果目标服务器下载 Node.js 较慢，可直接使用[通过镜像下载 Node.js](#通过镜像下载-nodejs)的命令。
 
 ### Ubuntu 或 Debian
 
@@ -47,18 +59,65 @@ finally { Remove-Item -LiteralPath $installer }
 New-NetFirewallRule -DisplayName 'SGS HTTP admin' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 17431 -RemoteAddress 'YOUR_PUBLIC_CLIENT_IP'
 ```
 
+### 通过镜像下载 Node.js
+
+目标服务器到 `nodejs.org` 下载大文件较慢时，例如在中国大陆，可以直接运行下面对应系统的命令。这里从本仓库主分支获取支持镜像参数的安装脚本，服务端运行包仍取自 GitHub 正式版。安装器从 Node.js 官网下载 `SHASUMS256.txt`，用它校验镜像中的压缩包。镜像下载失败会回退官网，校验失败会停止安装。
+
+Ubuntu／Debian
+
+```sh
+installer=$(mktemp)
+curl -fL --retry 3 -o "$installer" https://raw.githubusercontent.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/main/distribution/install-linux.sh &&
+  sudo sh "$installer" --node-mirror https://npmmirror.com/mirrors/node
+result=$?
+rm -f "$installer"
+test "$result" -eq 0
+```
+
+Windows Server 管理员 PowerShell
+
+```powershell
+$installer = Join-Path $env:TEMP ('sgs-install-' + [guid]::NewGuid() + '.ps1')
+try {
+    Invoke-WebRequest -UseBasicParsing -Uri 'https://raw.githubusercontent.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server/main/distribution/install-windows.ps1' -OutFile $installer
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer -NodeMirror 'https://npmmirror.com/mirrors/node'
+    if ($LASTEXITCODE) { throw "Installer failed (exit $LASTEXITCODE)" }
+}
+finally {
+    Remove-Item -LiteralPath $installer -ErrorAction SilentlyContinue
+}
+```
+
+目标服务器仍需能访问 GitHub 和 `nodejs.org` 的校验文件。镜像参数只影响 Node.js 压缩包下载。
+
 ## 第一次打开管理面板
 
 安装完成后，打开终端显示的 `HTTP admin link`。未指定域名时，安装程序通过 [ipify](https://www.ipify.org/) 查询公网 IPv4 用于显示链接。若输出 `SERVER_PUBLIC_IP_OR_DNS`，将其替换为云控制台显示的公网 IPv4 或服务器域名。HTTP 登录流量未加密。
 
 | 用途 | 默认地址 | 使用的凭据 |
 | --- | --- | --- |
-| HTTP 管理 | `http://服务器公网地址:17431/admin/` | 管理员密码。首次配置也可用 `First setup code`，有效 60 分钟 |
+| HTTP 管理 | `http://服务器公网地址:17431/admin/` | 管理员密码。配置全新公共实例也可用 `First setup code`，有效 60 分钟 |
 | 本机应急管理 | `http://127.0.0.1:17430/admin/` | 管理员密码 |
 | 初始私有同步 | `http://127.0.0.1:17429` | 工具箱的私有配对凭据 |
 | 公共同步和 HTTPS 管理 | `https://同步域名:8888` 与同地址的 `/admin/` | HTTPS 管理使用管理员密码 |
 
-### 开启公共同步
+## 绑定私有服务器
+
+1. 同机使用初始同步地址 `http://127.0.0.1:17429`。跨设备使用时，在管理页「网络设置」的「域名或 IP」栏填工具箱可以访问的服务器 IPv4 或域名，例如在内网用 `192.168.1.20`。填一个空闲的新同步端口，例如 `18429`。使用私有 HTTP 时保持「SSL 证书」关闭。保存后按[更换同步地址或端口](#更换同步地址或端口)检查连通性，再用新地址配对，例如 `http://192.168.1.20:18429`。
+2. 在工具箱打开「管理 → 云同步 → 私有服务器 → 四位码」。如需填写自己的地址，展开「更改私有服务器地址」，填写同步地址，再点击「生成四位配对码」。
+3. 在 5 分钟内把四位码填到服务端管理页的「私有配对」，点击「生成加密凭据」。把凭据粘回发起配对的工具箱，点击「同意并绑定私有服务器」。该凭据限用一次，有效 10 分钟。
+4. 工具箱提示「私有服务器绑定成功」后，核对服务端的账号和设备。主账号建立后，新设备也可先登录同一个游戏主账号，再用管理页生成的「主账号绑定凭据」配对。该凭据限用一次，有效 15 分钟。
+
+手动部署需要跨设备私有同步时，在原启动命令中增加 `--private-network`。一键安装已经启用。
+
+## 更换同步地址或端口
+
+1. 先记录当前同步地址。新增或修改同步域名或 IPv4，或切换 HTTP／HTTPS，必须同时在「同步端口」填一个空闲的新端口。比如把仅本机的 `http://127.0.0.1:17429` 改为 `http://192.168.1.20:18429`。沿用旧端口会提示「更改域名或 HTTP／HTTPS 时，请填写一个新端口」（`new_port_required`）。同域名、同协议续签证书可以沿用当前端口。
+2. 放行新同步端口，仅允许计划使用的客户端来源访问。云主机同时检查安全组和主机防火墙。保存后服务会监听候选端口，旧同步端口继续保留。从工具箱所在设备访问新地址的 `/health`，确认新监听可达。已有绑定时，旧地址要继续对工具箱可达，供它发现新地址。
+3. 新实例在工具箱用新地址完成绑定。已有私有绑定时，在正常使用工具箱的设备上登录同一游戏账号并触发同步，让工具箱通过旧地址发现并认证新地址。公共客户端需完成一次对新地址的实际同步，例如首次绑定后拉取数据。外部同步地址需要从服务端以外的设备发起认证。`/health` 返回成功只验证连通性，管理页登录也不会启动切换计时。
+4. 管理页显示「等待工具箱在新端口认证」时，旧端口会继续保留，等待无自动截止时间。首次有效认证后，管理页显示旧端口预计关闭时间。从这次认证起保留旧端口 60 分钟，随后新端口转正，旧监听释放。确认后再移除旧防火墙规则。候选地址填错时，可在管理页允许的情况下点「取消切换」再重设。
+
+## 开启公共同步
 
 1. 将同步域名的 DNS A 记录指向服务器公网 IPv4，为该域名签发受信任的证书。准备 PEM 格式的完整证书链和私钥，并在云安全组和主机防火墙允许选定的 HTTPS TCP 端口，例如 `8888`。
 2. 使用 HTTP 管理页时，在服务器上执行下面的命令放置证书文件，把示例路径换成实际路径。私钥留在服务器上。本机应急管理和 HTTPS 管理页可以选择 PEM 文件。
@@ -78,9 +137,11 @@ New-NetFirewallRule -DisplayName 'SGS HTTP admin' -Direction Inbound -Action All
    Copy-Item -LiteralPath 'C:\path\to\privkey.pem' -Destination (Join-Path $data 'setup-privkey.pem')
    ```
 
-3. 登录终端打印的管理页。在「网络设置」填同步域名与 HTTPS 端口，打开「SSL 证书」并保存。证书有效且服务成功监听后，同步自动强制 HTTPS，此时才可展开「转为公共服务器」，输入「转为公共」并确认。已有私有数据时，先按工具箱和后台的提示准备加密历史。
-4. 打开 `https://同步域名:端口/admin/`，确认浏览器信任该证书，再输入管理员密码。首次设置码在这次登录后失效，HTTP 管理地址继续可用。确认公共服务可用后，可以删除数据目录里的两份临时证书文件。
-5. 用户在工具箱「云同步」中填写 HTTPS 同步地址。管理员可在后台调整绑定上限和分享开关。
+3. 在「网络设置」填写同步域名和不同于旧端口的 HTTPS **同步端口**，启用「SSL 证书」，点击「保存网络设置」。从服务器外访问 `https://同步域名:端口/health`。收到 HTTP 200 和 `"ok":true` 表示同步端口已走通，此时 `mode` 仍是 `private`。已有私有绑定可在准备历史时认证新端口。全新实例可以先转公共，再由首位已绑定的工具箱实际同步来确认新端口。端口何时转正见[更换同步地址或端口](#更换同步地址或端口)。
+4. 已有私有历史时，用管理员密码管理实例。分别登录每个有历史的游戏账号，在工具箱「云同步」选择「准备转为公共模式」，等后台显示历史均已就绪。若有移除账号处于 30 天恢复期，先恢复账号或等待恢复期结束。全新实例可以直接进入下一步。
+5. 展开「转为公共服务器」，输入 `转为公共` 并确认。转换会停用旧私有授权并清理服务在线使用的明文历史。这一步不可逆。所有已准备账号随后应在工具箱点击「启用已准备的公共连接」，并保存公共恢复凭据。
+6. 再访问同步地址的 `/health`，确认 `mode` 是 `public`。此时可以打开 HTTPS 管理页，默认路径 `/admin/`，已改过路径就使用当前路径。浏览器信任证书后再用管理员密码登录。首次成功登录 HTTPS 后台会使首次设置码失效。HTTP 管理入口仍由「管理入口」中的开关控制。使用文件配置证书的实例验证完成后，可以删除第 2 步复制的两份临时 PEM。
+7. 新用户在工具箱「管理 → 云同步 → 公共服务器」填写 HTTPS 同步地址并完成绑定。核对工具箱能实际同步。管理员可在后台调整绑定上限和分享开关。
 
 ## 关闭 HTTP 管理或更换路径
 
@@ -108,6 +169,14 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $maintenance -ResetPassw
 ```
 
 通过源码手动部署的实例，先停止服务，再在原数据目录执行 `node tools/appearance-sync.mjs --data-dir /path/to/data --reset-admin-password` 并重新启动。老实例升级后仍可用原密码登录和修改。
+
+## 排查同步连接
+
+| 现象 | 处理方式 |
+| --- | --- |
+| 保存域名或协议时提示 `new_port_required` | 选一个与当前同步端口不同且空闲的端口，检查管理端口、现有监听和防火墙。 |
+| 新端口 `/health` 正常，后台一直等待认证 | 在实际工具箱上完成绑定或触发同步。外部地址从另一台设备验证。后台出现旧端口关闭时间，表示 60 分钟保留期已经开始。 |
+| HTTPS 的 `/health` 可访问，管理页打不开 | 确认 `mode` 已为 `public`，再检查当前后台路径。手动部署还需核对 `--https-admin`。 |
 
 ## 接管观星
 

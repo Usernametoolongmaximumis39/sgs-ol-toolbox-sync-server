@@ -10,12 +10,13 @@ setup_host=
 repo=https://github.com/Usernametoolongmaximumis39/sgs-ol-toolbox-sync-server
 bundle=sgs-ol-toolbox-sync-server.tar.gz
 node_version=v24.20.0
+node_mirror=
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --help) echo 'sudo sh install-linux.sh [--host PUBLIC_IP_OR_DNS] [--service-name NAME] [--sync-port PORT] [--admin-port PORT] [--setup-port PORT]'; exit ;;
-        --host|--service-name|--sync-port|--admin-port|--setup-port)
+        --help) echo 'sudo sh install-linux.sh [--host PUBLIC_IP_OR_DNS] [--service-name NAME] [--sync-port PORT] [--admin-port PORT] [--setup-port PORT] [--node-mirror HTTPS_URL]'; exit ;;
+        --host|--service-name|--sync-port|--admin-port|--setup-port|--node-mirror)
             [ "$#" -ge 2 ] || fail "Missing argument for $1"
             case "$1" in
                 --service-name) service=$2 ;;
@@ -23,6 +24,11 @@ while [ "$#" -gt 0 ]; do
                 --admin-port) admin_port=$2 ;;
                 --setup-port) setup_port=$2 ;;
                 --host) setup_host=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]') ;;
+                --node-mirror)
+                    case "$2" in
+                        https://?*) node_mirror=${2%/} ;;
+                        *) fail 'Use an HTTPS URL for --node-mirror.' ;;
+                    esac ;;
             esac
             shift 2 ;;
         *) fail "Unknown option: $1" ;;
@@ -182,7 +188,12 @@ printf '%s  %s\n' "$digest" "$work/$bundle" | sha256sum --check --status || fail
 node_file="node-$node_version-linux-$arch.tar.xz"
 node_url="https://nodejs.org/dist/$node_version"
 download "$node_url/SHASUMS256.txt" "$work/node.sha256"
-download "$node_url/$node_file" "$work/$node_file"
+if [ -z "$node_mirror" ]; then
+    download "$node_url/$node_file" "$work/$node_file"
+elif ! download "$node_mirror/$node_version/$node_file" "$work/$node_file"; then
+    echo 'Node.js mirror download failed, retrying from nodejs.org.' >&2
+    download "$node_url/$node_file" "$work/$node_file"
+fi
 digest=$(awk -v name="$node_file" '$2 == name { print $1 }' "$work/node.sha256")
 printf '%s\n' "$digest" | grep -Eq '^[0-9a-f]{64}$' || fail 'Invalid Node.js checksum.'
 printf '%s  %s\n' "$digest" "$work/$node_file" | sha256sum --check --status || fail 'Node.js checksum mismatch.'

@@ -5,7 +5,8 @@ param(
     [ValidateRange(1,65535)][int]$AdminPort = 17430,
     [ValidateRange(1,65535)][int]$SetupPort = 17431,
     [string]$HostName,
-    [switch]$ResetPassword
+    [switch]$ResetPassword,
+    [ValidatePattern('^https://[^/\s]+')][string]$NodeMirror
 )
 
 $ErrorActionPreference = 'Stop'
@@ -172,8 +173,17 @@ function Install-OrReset {
             $nodeName = "node-$nodeVersion-win-x64.zip"
             $nodeZip = Join-Path $work $nodeName
             $nodeHashes = Join-Path $work 'node.sha256'
-            Get-Download "https://nodejs.org/dist/$nodeVersion/SHASUMS256.txt" $nodeHashes
-            Get-Download "https://nodejs.org/dist/$nodeVersion/$nodeName" $nodeZip
+            $nodeUrl = "https://nodejs.org/dist/$nodeVersion"
+            Get-Download "$nodeUrl/SHASUMS256.txt" $nodeHashes
+            if ($NodeMirror) {
+                try { Get-Download "$($NodeMirror.TrimEnd('/'))/$nodeVersion/$nodeName" $nodeZip }
+                catch {
+                    Write-Warning 'Node.js mirror download failed, retrying from nodejs.org.'
+                    Get-Download "$nodeUrl/$nodeName" $nodeZip
+                }
+            } else {
+                Get-Download "$nodeUrl/$nodeName" $nodeZip
+            }
             Assert-Checksum $nodeZip $nodeHashes $nodeName
             Expand-Archive -LiteralPath $nodeZip -DestinationPath (Join-Path $work 'node')
         }
