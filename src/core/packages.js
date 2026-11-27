@@ -14,9 +14,9 @@ export function validateManifest(m, options) {
   if (m.apiVersion !== 1) throw new Error('插件需要不兼容的核心 API。');
   validatePluginPresentation(m, options);
 }
-export async function verifyPackage(pkg) {
+export async function verifyPackage(pkg, options) {
   if (pkg?.format !== PACKAGE_FORMAT || typeof pkg.code !== 'string' || pkg.code.length > 10 * 1024 * 1024) throw new Error('插件包格式不正确或超过 10 MB。');
-  validateManifest(pkg.manifest);
+  validateManifest(pkg.manifest, options);
   if (await packageDigest(pkg.manifest, pkg.code) !== String(pkg.sha256).toLowerCase()) throw new Error('插件包校验失败，文件可能损坏。');
   return pkg;
 }

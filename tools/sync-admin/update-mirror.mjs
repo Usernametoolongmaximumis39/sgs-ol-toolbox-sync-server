@@ -8,7 +8,8 @@ import { MarketClient } from '../../src/market/client.js';
 import { compareVersions } from '../../src/market/updates.js';
 
 const repository = new URL(GITHUB_MARKET_URL).pathname.split('/').slice(1, 3).join('/');
-const refUrl = 'https://api.github.com/repos/' + repository + '/git/ref/heads/main';
+const api = 'https://api.github.com/repos/' + repository;
+const refUrl = api + '/git/ref/heads/main';
 const raw = 'https://raw.githubusercontent.com/' + repository + '/';
 const versionFormat = /^\d+\.\d+\.\d+$/;
 const commitFormat = /^[a-f0-9]{40}$/;
@@ -20,6 +21,7 @@ const retiredPaths = new Set(['full/toolbox.meta.js', 'full/toolbox.user.js']);
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 const MAX_SCRIPT = 12 * 1024 * 1024;
 const REF_TIMEOUT = 20_000;
+const RAW_TIMEOUT = 25_000;
 const ARTIFACT_TIMEOUT = 5 * 60_000;
 
 async function readBody(response, limit) {
@@ -63,18 +65,33 @@ export async function openUpdateMirror({ dataDir, enabled, auto, fetchImpl = glo
   } catch (cause) { if (cause.code !== 'ENOENT') error = '本地更新缓存无法读取，等待重新同步'; }
   const request = (url, timeout, headers) => fetchImpl(url, { headers, redirect: 'error',
     signal: AbortSignal.any([shutdown.signal, AbortSignal.timeout(timeout)]) });
+  const apiHeaders = accept => ({ Accept: accept, 'User-Agent': 'sgs-toolbox-update-mirror',
+    ...(token && { Authorization: 'Bearer ' + token }) });
 
   async function poll() {
     lastCheck = now();
-    const response = await request(refUrl, REF_TIMEOUT, { Accept: 'application/vnd.github+json', 'User-Agent': 'sgs-toolbox-update-mirror',
-      ...(token && { Authorization: 'Bearer ' + token }), ...(etag && { 'If-None-Match': etag }) });
+    const response = await request(refUrl, REF_TIMEOUT, { ...apiHeaders('application/vnd.github+json'),
+      ...(etag && { 'If-None-Match': etag }) });
     if (response.status === 304 && current) return;
     const commit = JSON.parse(await readBody(response, 16384))?.object?.sha;
     if (!commitFormat.test(commit)) throw new Error('GitHub 分支引用无效');
     const nextEtag = response.headers.get('etag');
     if (current?.commit === commit) { etag = nextEtag; return; }
     const root = raw + commit + '/', files = { ...current?.files };
-    const download = async (path, limit = MAX_SCRIPT) => readBody(await request(root + path, ARTIFACT_TIMEOUT), limit);
+    let useContentsApi = false;
+    async function download(path, limit = MAX_SCRIPT, optional = false) {
+      const read = response => optional && response.status === 404 ? null : readBody(response, limit);
+      if (!useContentsApi) {
+        try { return await read(await request(root + path, RAW_TIMEOUT)); }
+        catch (cause) {
+          if (shutdown.signal.aborted) throw cause;
+          useContentsApi = true;
+        }
+      }
+      const url = api + '/contents/' + path + '?ref=' + commit;
+      try { return await read(await request(url, ARTIFACT_TIMEOUT, apiHeaders('application/vnd.github.raw+json'))); }
+      catch (cause) { throw new Error(`GitHub 下载 ${path} 失败（${cause.message}）`, { cause }); }
+    }
     await mkdir(objects, { recursive: true, mode: 0o700 });
     async function save(path, bytes) {
       const digest = hash(bytes);
@@ -106,7 +123,8 @@ export async function openUpdateMirror({ dataDir, enabled, auto, fetchImpl = glo
             bytes = await readFile(join(objects, files[path]));
             if (hash(bytes) !== files[path]) throw new Error('本地插件缓存校验失败');
           } else bytes = await download(path, 8 * 1024 * 1024);
-          const pkg = await verifyPackage(JSON.parse(bytes));
+          // The client checks the minimum core version against its own version during installation.
+          const pkg = await verifyPackage(JSON.parse(bytes), { checkCompatibility: false });
           if (pkg.manifest.id !== entry.id || pkg.manifest.version !== entry.version || pkg.sha256.toLowerCase() !== entry.sha256.toLowerCase()
             || entry.releaseNotes !== undefined && entry.releaseNotes !== pkg.manifest.releaseNotes) {
             throw new Error('GitHub 插件包与目录摘要不一致');
@@ -124,10 +142,10 @@ export async function openUpdateMirror({ dataDir, enabled, auto, fetchImpl = glo
     validateUserscript(meta, script, version);
     await save(liteMetaPath, meta);
     await save(liteScriptPath, script);
-    const microPath = 'microclient/update.json', micro = await request(root + microPath, ARTIFACT_TIMEOUT);
+    const microPath = 'microclient/update.json', manifestBytes = await download(microPath, 16384, true);
     let microVersion = current?.microVersion;
-    if (micro.status !== 404) {
-      const manifestBytes = await readBody(micro, 16384), manifest = JSON.parse(manifestBytes);
+    if (manifestBytes) {
+      const manifest = JSON.parse(manifestBytes);
       if (manifest.format !== 'sgs-toolbox-script-v1' || manifest.hostApi !== 1 || !versionFormat.test(manifest.version)
         || microVersion && compareVersions(manifest.version, microVersion) < 0 || !digestFormat.test(manifest.sha256)
         || !Number.isInteger(manifest.bytes) || manifest.bytes < 1 || manifest.bytes > MAX_SCRIPT) throw new Error('微端更新清单无效或回退');
